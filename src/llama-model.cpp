@@ -1686,7 +1686,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
                 struct aipc_pending {
                     ggml_tensor * src;
+                    ggml_tensor * src_b;  // per-expert bias source (nullptr = no bias / plain SwiGLU)
                     ggml_tensor * hot;
+                    ggml_tensor * hot_b;  // VRAM bias copy in hot-slot order (nullptr if no bias)
                     ggml_tensor * lookup;
                     ggml_tensor * mask;
                     ggml_tensor * iota;
@@ -1696,8 +1698,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 };
                 std::vector<aipc_pending> pending;
 
+                // per layer: 3 weight copies + 3 table tensors + up to 3 bias copies
                 ggml_init_params ip = {
-                    /*.mem_size   =*/ ggml_tensor_overhead() * (hot_ids.size() * 6 + 8),
+                    /*.mem_size   =*/ ggml_tensor_overhead() * (hot_ids.size() * 9 + 8),
                     /*.mem_buffer =*/ nullptr,
                     /*.no_alloc   =*/ true,
                 };
@@ -1750,11 +1753,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     ggml_format_name(lookup, "aipc_lookup-%d", il);
                     ggml_format_name(mask,   "aipc_mask-%d",   il);
                     ggml_format_name(iota,   "aipc_iota-%d",   il);
+                    // per-expert biases (gpt-oss / SWIGLU_OAI): copied to VRAM in the SAME
+                    // hot-slot order as the weights so sel_hot indexes both consistently.
+                    // Only used when ALL three exist and are host F32 (0-row bias = corrupt).
+                    ggml_tensor * srcs_b[3] = { lay.ffn_up_exps_b, lay.ffn_gate_exps_b, lay.ffn_down_exps_b };
+                    bool have_bias = true;
+                    for (ggml_tensor * b : srcs_b) {
+                        have_bias = have_bias && b && b->buffer && ggml_backend_buffer_is_host(b->buffer) &&
+                                    b->data && b->type == GGML_TYPE_F32 && (int) b->ne[1] == n_expert_t;
+                    }
                     for (int p = 0; p < 3; p++) {
                         ggml_tensor * s   = srcs[p];
                         ggml_tensor * hot = ggml_new_tensor_3d(ctx_hot, s->type, s->ne[0], s->ne[1], n_hot + n_pad);
                         ggml_format_name(hot, "aipc_hot__%s", s->name);
-                        pending.push_back({ s, hot, lookup, mask, iota, n_pad, p == 0, { ids_ok.begin(), ids_ok.begin() + n_hot } });
+                        ggml_tensor * s_b   = have_bias ? srcs_b[p] : nullptr;
+                        ggml_tensor * hot_b = nullptr;
+                        if (s_b) {
+                            hot_b = ggml_new_tensor_2d(ctx_hot, s_b->type, s_b->ne[0], n_hot + n_pad);
+                            ggml_format_name(hot_b, "aipc_hotb__%s", s_b->name);
+                        }
+                        pending.push_back({ s, s_b, hot, hot_b, lookup, mask, iota, n_pad, p == 0, { ids_ok.begin(), ids_ok.begin() + n_hot } });
                     }
                 }
 
@@ -1782,6 +1800,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                                 ggml_backend_tensor_set(pe.hot, zeros.data(),
                                         (size_t) (n_hot + i) * pe.hot->nb[2], pe.hot->nb[2]);
                             }
+                            // per-expert bias copy in the same hot-slot order; dummy slots
+                            // ZEROED so sel_hot's dummy ids add a zero (finite) bias -> the
+                            // masked-out hot output at cold positions stays finite (no 0*Inf=NaN)
+                            if (pe.hot_b) {
+                                for (int i = 0; i < n_hot; i++) {
+                                    ggml_backend_tensor_set(pe.hot_b,
+                                            (const char *) pe.src_b->data + (size_t) pe.ids[i] * pe.src_b->nb[1],
+                                            (size_t) i * pe.hot_b->nb[1], pe.src_b->nb[1]);
+                                }
+                                std::vector<uint8_t> zeros_b(pe.hot_b->nb[1], 0);
+                                for (int i = 0; i < pe.n_pad; i++) {
+                                    ggml_backend_tensor_set(pe.hot_b, zeros_b.data(),
+                                            (size_t) (n_hot + i) * pe.hot_b->nb[1], pe.hot_b->nb[1]);
+                                }
+                            }
                             if (pe.fill_tables) {
                                 // lookup stored as F32 (small ids, exact) so ggml_get_rows works in the graph
                                 std::vector<float> lk(pe.lookup->ne[0], 0.0f);
@@ -1798,14 +1831,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                                 ggml_backend_tensor_set(pe.mask,   mk.data(), 0, mk.size() * sizeof(float));
                                 ggml_backend_tensor_set(pe.iota,   io.data(), 0, io.size() * sizeof(float));
                             }
-                            aipc_moe_split_register(pe.src, { pe.hot, pe.lookup, pe.mask, pe.iota, n_hot, pe.n_pad });
+                            aipc_moe_split_register(pe.src, { pe.hot, pe.hot_b, pe.lookup, pe.mask, pe.iota, n_hot, pe.n_pad });
                         }
                         const size_t vram_mb = ggml_backend_buffer_get_size(buf_hot) / 1024 / 1024;
+                        bool any_bias = false;
+                        for (auto & pe : pending) { any_bias = any_bias || pe.hot_b; }
                         std::vector<ggml_backend_buffer_ptr> bufs_hot;
                         bufs_hot.emplace_back(buf_hot);
                         pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(ctx_hot), std::move(bufs_hot));
-                        LLAMA_LOG_INFO("%s: AIPC split: %zu hot tensors across %zu layers, %d experts/layer, %zu MiB of VRAM\n",
-                                __func__, pending.size(), pending.size() / 3, n_hot_req, vram_mb);
+                        LLAMA_LOG_INFO("%s: AIPC split: %zu hot tensors across %zu layers, %d experts/layer, bias=%s, %zu MiB of VRAM\n",
+                                __func__, pending.size(), pending.size() / 3, n_hot_req, any_bias ? "yes" : "no", vram_mb);
                     }
                 }
             }

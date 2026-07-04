@@ -1794,6 +1794,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn_split(
          ggml_tensor * up_exps,
          ggml_tensor * gate_exps,
          ggml_tensor * down_exps,
+         ggml_tensor * up_exps_b,
+         ggml_tensor * gate_exps_b,
+         ggml_tensor * down_exps_b,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
@@ -1811,9 +1814,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn_split(
     if (n_tk > 8) {
         return nullptr;
     }
-    // shapes supported in V2.0: gated SwiGLU, no per-expert biases/scales
-    if (!gate_exps || up_exps_s || gate_exps_s || down_exps_s || type_op != LLM_FFN_SILU) {
+    // per-expert scales are not replicated on the hot side -> disable the split
+    if (up_exps_s || gate_exps_s || down_exps_s) {
         return nullptr;
+    }
+    // two activation families are supported:
+    //   - plain gated SwiGLU (SILU), NO per-expert bias  (Coder-Next, etc.)
+    //   - SWIGLU_OAI with per-expert up/gate/down bias    (gpt-oss family)
+    // anything else falls back to the stock batched path
+    const bool is_oai = (type_op == LLM_FFN_SWIGLU_OAI_MOE);
+    if (is_oai) {
+        // OAI needs the gate AND all three per-expert biases present
+        if (!gate_exps || !up_exps_b || !gate_exps_b || !down_exps_b) {
+            return nullptr;
+        }
+    } else {
+        // plain path: gated SILU only, and it must have NO per-expert bias
+        if (!gate_exps || up_exps_b || gate_exps_b || down_exps_b || type_op != LLM_FFN_SILU) {
+            return nullptr;
+        }
     }
     // LoRAs on the experts would only apply to the cold chain (the hot copy is
     // not in the adapter map) -> inconsistent result; disable the split
@@ -1823,6 +1842,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn_split(
     const aipc_moe_split * sp_gate = aipc_moe_split_lookup(gate_exps);
     const aipc_moe_split * sp_down = aipc_moe_split_lookup(down_exps);
     if (sp_gate == nullptr || sp_down == nullptr) {
+        return nullptr;
+    }
+    // OAI: the hot side must carry hot-slot bias copies for all three projections;
+    // without them sel_hot's dummy ids would index the wrong / out-of-range bias row.
+    // If the copies are missing (e.g. bias not host-resident at load), fall back.
+    if (is_oai && (!sp_up->hot_b || !sp_gate->hot_b || !sp_down->hot_b)) {
         return nullptr;
     }
 
@@ -1850,14 +1875,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn_split(
             ggml_sub(ctx0, gid_f, ggml_mul(ctx0, gid_f, mask_kT)), GGML_TYPE_I32);
 
     // full chain per side (up/gate/act/down) — a single merge at the end of the
-    // layer, to avoid per-projection CPU<->GPU ping-pong
+    // layer, to avoid per-projection CPU<->GPU ping-pong.
+    // bias ids follow the SAME remap as the weights: hot side indexes the hot-slot
+    // bias copies with sel_hot (dummy slots -> zeroed bias, finite), cold side
+    // indexes the original per-expert bias with sel_cold. Op order matches stock:
+    //   up mm -> +up_b ; gate mm -> +gate_b ; act ; down mm -> +down_b.
     const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
     constexpr float eps = 1e-6f;
-    auto chain = [&](ggml_tensor * t_up, ggml_tensor * t_gate, ggml_tensor * t_down, ggml_tensor * ids) {
+    auto chain = [&](ggml_tensor * t_up,   ggml_tensor * t_up_b,
+                     ggml_tensor * t_gate, ggml_tensor * t_gate_b,
+                     ggml_tensor * t_down, ggml_tensor * t_down_b,
+                     ggml_tensor * ids) {
         ggml_tensor * u = build_lora_mm_id(t_up,   cur, ids, nullptr);
+        if (t_up_b) {
+            u = ggml_add_id(ctx0, u, t_up_b, ids);
+        }
         ggml_tensor * g = build_lora_mm_id(t_gate, cur, ids, nullptr);
+        if (t_gate_b) {
+            g = ggml_add_id(ctx0, g, t_gate_b, ids);
+        }
         ggml_tensor * x = nullptr;
-        if (limit > eps) {
+        if (is_oai) {
+            // exact stock SWIGLU_OAI: per element
+            //   x=min(gate,7); y=clamp(up,-7,7); out = x*sigmoid(1.702*x)*(y+1)
+            constexpr float alpha    = 1.702f;
+            constexpr float oai_clip = 7.0f;
+            x = ggml_swiglu_oai(ctx0, g, u, alpha, oai_clip);
+        } else if (limit > eps) {
             u = ggml_clamp(ctx0, u, -limit, limit);
             if (arch == LLM_ARCH_DEEPSEEK4) {
                 // DEEPSEEK4 variant: clamp the gate BEFORE swiglu (parity with the original path)
@@ -1871,10 +1915,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn_split(
         } else {
             x = ggml_swiglu_split(ctx0, g, u);
         }
-        return build_lora_mm_id(t_down, x, ids, nullptr);
+        ggml_tensor * d = build_lora_mm_id(t_down, x, ids, nullptr);
+        if (t_down_b) {
+            d = ggml_add_id(ctx0, d, t_down_b, ids);
+        }
+        return d;
     };
-    ggml_tensor * e_hot  = chain(sp_up->hot, sp_gate->hot, sp_down->hot, sel_hot);   // VRAM
-    ggml_tensor * e_cold = chain(up_exps,    gate_exps,    down_exps,    sel_cold);  // RAM/CPU
+    // hot side uses the VRAM hot-slot bias copies; cold side the original biases
+    ggml_tensor * hot_up_b   = is_oai ? sp_up->hot_b   : nullptr;
+    ggml_tensor * hot_gate_b = is_oai ? sp_gate->hot_b : nullptr;
+    ggml_tensor * hot_down_b = is_oai ? sp_down->hot_b : nullptr;
+    ggml_tensor * e_hot  = chain(sp_up->hot, hot_up_b,   sp_gate->hot, hot_gate_b, sp_down->hot, hot_down_b, sel_hot);  // VRAM
+    ggml_tensor * e_cold = chain(up_exps,    up_exps_b,  gate_exps,    gate_exps_b, down_exps,   down_exps_b, sel_cold); // RAM/CPU
 
     // experts = cold + (hot - cold) * mask
     ggml_tensor * mask_b  = ggml_reshape_3d(ctx0, mask_kT, 1, n_ku, n_tk);
@@ -2059,8 +2111,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    // AIPC V2.0: dual hot/cold chain (decode); nullptr => original path
+    // AIPC V2.0: dual hot/cold chain (decode); nullptr => original path.
+    // Per-expert biases are threaded through for the SWIGLU_OAI (gpt-oss) variant;
+    // the merged gate_up path leaves gate_exps null so the split bails there.
     experts = build_moe_ffn_split(cur, selected_experts, up_exps, gate_exps, down_exps,
+            up_exps_b, gate_exps_b, down_exps_b,
             up_exps_s, gate_exps_s, down_exps_s, type_op, il);
     if (experts == nullptr) {
     // (original path; indentation preserved)
