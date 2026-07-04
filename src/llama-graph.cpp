@@ -1,6 +1,7 @@
 #include "llama-graph.h"
 
 #include "llama-impl.h"
+#include "llama-aipc-moe.h"
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
@@ -1787,6 +1788,101 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     );
 }
 
+ggml_tensor * llm_graph_context::build_moe_ffn_split(
+         ggml_tensor * cur,
+         ggml_tensor * selected_experts,
+         ggml_tensor * up_exps,
+         ggml_tensor * gate_exps,
+         ggml_tensor * down_exps,
+         ggml_tensor * up_exps_s,
+         ggml_tensor * gate_exps_s,
+         ggml_tensor * down_exps_s,
+     llm_ffn_op_type   type_op,
+                 int   il) const {
+    const aipc_moe_split * sp_up = aipc_moe_split_lookup(up_exps);
+    if (sp_up == nullptr) {
+        return nullptr;
+    }
+    const int64_t n_ku = selected_experts->ne[0];
+    const int64_t n_tk = selected_experts->ne[1];
+
+    // decode/small batches only: for prefill the original batched path is better
+    // (bulk weight copy) and this avoids covering batch kernels on this path
+    if (n_tk > 8) {
+        return nullptr;
+    }
+    // shapes supported in V2.0: gated SwiGLU, no per-expert biases/scales
+    if (!gate_exps || up_exps_s || gate_exps_s || down_exps_s || type_op != LLM_FFN_SILU) {
+        return nullptr;
+    }
+    // LoRAs on the experts would only apply to the cold chain (the hot copy is
+    // not in the adapter map) -> inconsistent result; disable the split
+    if (loras != nullptr && !loras->empty()) {
+        return nullptr;
+    }
+    const aipc_moe_split * sp_gate = aipc_moe_split_lookup(gate_exps);
+    const aipc_moe_split * sp_down = aipc_moe_split_lookup(down_exps);
+    if (sp_gate == nullptr || sp_down == nullptr) {
+        return nullptr;
+    }
+
+    // per-layer tables: lookup (global id -> hot slot, F32) and mask (1=hot).
+    // get_rows requires table batch == ids batch -> flatten the ids to 1D
+    // (cont: top-k returns a non-contiguous view)
+    ggml_tensor * lut2d = ggml_reshape_2d(ctx0, sp_up->lookup, 1, sp_up->lookup->ne[0]);
+    ggml_tensor * msk2d = ggml_reshape_2d(ctx0, sp_up->mask,   1, sp_up->mask->ne[0]);
+    ggml_tensor * sel_flat = ggml_reshape_1d(ctx0, ggml_cont(ctx0, selected_experts), n_ku * n_tk);
+
+    ggml_tensor * mask_kT = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, msk2d, sel_flat), n_ku, n_tk);
+
+    // hot side: local ids; cold positions go to ZEROED dummy slots UNIQUE per
+    // k position (iota), preserving the unique-ids-per-token invariant of the
+    // mul_mat_id kernels: sel = iota + (lookup - iota) * mask
+    ggml_tensor * lut_g  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, lut2d, sel_flat), n_ku, n_tk);
+    ggml_tensor * iota_b = ggml_repeat(ctx0, ggml_reshape_2d(ctx0, sp_up->iota, sp_up->n_pad, 1), mask_kT);
+    ggml_tensor * sel_hot = ggml_cast(ctx0,
+            ggml_add(ctx0, iota_b, ggml_mul(ctx0, ggml_sub(ctx0, lut_g, iota_b), mask_kT)), GGML_TYPE_I32);
+
+    // cold side: global ids with hot positions clamped to 0 — avoids re-reading
+    // hot experts from RAM (repeated reads of expert 0 stay in cache)
+    ggml_tensor * gid_f = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+    ggml_tensor * sel_cold = ggml_cast(ctx0,
+            ggml_sub(ctx0, gid_f, ggml_mul(ctx0, gid_f, mask_kT)), GGML_TYPE_I32);
+
+    // full chain per side (up/gate/act/down) — a single merge at the end of the
+    // layer, to avoid per-projection CPU<->GPU ping-pong
+    const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+    constexpr float eps = 1e-6f;
+    auto chain = [&](ggml_tensor * t_up, ggml_tensor * t_gate, ggml_tensor * t_down, ggml_tensor * ids) {
+        ggml_tensor * u = build_lora_mm_id(t_up,   cur, ids, nullptr);
+        ggml_tensor * g = build_lora_mm_id(t_gate, cur, ids, nullptr);
+        ggml_tensor * x = nullptr;
+        if (limit > eps) {
+            u = ggml_clamp(ctx0, u, -limit, limit);
+            if (arch == LLM_ARCH_DEEPSEEK4) {
+                // DEEPSEEK4 variant: clamp the gate BEFORE swiglu (parity with the original path)
+                g = ggml_clamp(ctx0, g, -INFINITY, limit);
+                x = ggml_swiglu_split(ctx0, g, u);
+            } else {
+                ggml_tensor * ga = ggml_silu(ctx0, g);
+                ga = ggml_clamp(ctx0, ga, -INFINITY, limit);
+                x = ggml_mul(ctx0, ga, u);
+            }
+        } else {
+            x = ggml_swiglu_split(ctx0, g, u);
+        }
+        return build_lora_mm_id(t_down, x, ids, nullptr);
+    };
+    ggml_tensor * e_hot  = chain(sp_up->hot, sp_gate->hot, sp_down->hot, sel_hot);   // VRAM
+    ggml_tensor * e_cold = chain(up_exps,    gate_exps,    down_exps,    sel_cold);  // RAM/CPU
+
+    // experts = cold + (hot - cold) * mask
+    ggml_tensor * mask_b  = ggml_reshape_3d(ctx0, mask_kT, 1, n_ku, n_tk);
+    ggml_tensor * experts = ggml_add(ctx0, e_cold, ggml_mul(ctx0, ggml_sub(ctx0, e_hot, e_cold), mask_b));
+    cb(experts, "ffn_moe_down", il);
+    return experts;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -1963,6 +2059,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    // AIPC V2.0: dual hot/cold chain (decode); nullptr => original path
+    experts = build_moe_ffn_split(cur, selected_experts, up_exps, gate_exps, down_exps,
+            up_exps_s, gate_exps_s, down_exps_s, type_op, il);
+    if (experts == nullptr) {
+    // (original path; indentation preserved)
+
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
@@ -2097,6 +2199,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
     }
+
+    } // AIPC V2.0: end of the original path (experts == nullptr)
 
     if (!weight_before_ffn) {
         experts = ggml_mul(ctx0, experts, weights);

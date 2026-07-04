@@ -1024,6 +1024,21 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
+    // AIPC V2.0: MoE FFN with a hot/cold split into full chains (up/gate/act/down
+    // per side, a single merge at the end) — decode only, supported shapes only.
+    // Returns the "experts" tensor [n_embd, k, T], or nullptr to use the original path.
+    ggml_tensor * build_moe_ffn_split(
+             ggml_tensor * cur,
+             ggml_tensor * selected_experts,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * up_exps_s,
+             ggml_tensor * gate_exps_s,
+             ggml_tensor * down_exps_s,
+         llm_ffn_op_type   type_op,
+                     int   il) const;
+
     //
     // inputs
     //
