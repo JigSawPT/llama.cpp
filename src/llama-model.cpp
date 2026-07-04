@@ -21,13 +21,42 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
+#include "llama-aipc-moe.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
+#include <sstream>
+#include <mutex>
+#include <unordered_map>
+
+// AIPC V2.0: global registry for the hot/cold split (see llama-aipc-moe.h).
+// The mutex guards register/lookup/clear; unordered_map values are stable
+// (node-based), so the pointer returned by lookup survives inserts.
+static std::unordered_map<const ggml_tensor *, aipc_moe_split> g_aipc_moe_splits;
+static std::mutex g_aipc_moe_mutex;
+
+const aipc_moe_split * aipc_moe_split_lookup(const ggml_tensor * exps) {
+    std::lock_guard<std::mutex> lock(g_aipc_moe_mutex);
+    const auto it = g_aipc_moe_splits.find(exps);
+    return it == g_aipc_moe_splits.end() ? nullptr : &it->second;
+}
+
+void aipc_moe_split_register(const ggml_tensor * exps, const aipc_moe_split & split) {
+    std::lock_guard<std::mutex> lock(g_aipc_moe_mutex);
+    g_aipc_moe_splits[exps] = split;
+}
+
+void aipc_moe_split_clear() {
+    std::lock_guard<std::mutex> lock(g_aipc_moe_mutex);
+    g_aipc_moe_splits.clear();
+}
 #include <map>
 #include <numeric>
 #include <regex>
@@ -1619,6 +1648,167 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    // AIPC V2.0: hot/cold split of MoE experts (see llama-aipc-moe.h and AI_PC docs/08).
+    // AIPC_MOE_HOT_LIST: per-layer file "il id id ..." (hot->cold order, from aipc-moe-profile).
+    // AIPC_MOE_HOT_N:    number of hot experts per layer to copy to VRAM (absent/0 = validate only).
+    // ALWAYS clear the registry: entries from a previous model in the same process
+    // would be use-after-free (e.g. llama-bench with -ncmoe lists reloads the model).
+    aipc_moe_split_clear();
+    if (const char * hl = std::getenv("AIPC_MOE_HOT_LIST"); hl && *hl) {
+        std::ifstream f(hl);
+        if (!f) {
+            LLAMA_LOG_WARN("%s: AIPC hot-list: could not open '%s'\n", __func__, hl);
+        } else {
+            std::map<int, std::vector<int>> hot_ids;
+            std::string line;
+            while (std::getline(f, line)) {
+                std::istringstream is(line);
+                int il = -1;
+                if (!(is >> il) || il < 0) {
+                    continue;
+                }
+                int id = 0;
+                while (is >> id) {
+                    hot_ids[il].push_back(id);
+                }
+            }
+            const char * hn = std::getenv("AIPC_MOE_HOT_N");
+            const int n_hot_req = hn ? atoi(hn) : 0;
+            ggml_backend_dev_t dev_gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            if (n_hot_req <= 0 || dev_gpu == nullptr) {
+                LLAMA_LOG_INFO("%s: AIPC hot-list: %zu layers read (split inactive: AIPC_MOE_HOT_N=%d, gpu=%s)\n",
+                        __func__, hot_ids.size(), n_hot_req, dev_gpu ? "yes" : "no");
+            } else {
+                ggml_backend_buffer_type_t buft_gpu = ggml_backend_dev_buffer_type(dev_gpu);
+
+                struct aipc_pending {
+                    ggml_tensor * src;
+                    ggml_tensor * hot;
+                    ggml_tensor * lookup;
+                    ggml_tensor * mask;
+                    ggml_tensor * iota;
+                    int n_pad;
+                    bool fill_tables;
+                    std::vector<int> ids;
+                };
+                std::vector<aipc_pending> pending;
+
+                ggml_init_params ip = {
+                    /*.mem_size   =*/ ggml_tensor_overhead() * (hot_ids.size() * 6 + 8),
+                    /*.mem_buffer =*/ nullptr,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context * ctx_hot = ggml_init(ip);
+
+                for (auto & [il, ids] : hot_ids) {
+                    if (il < 0 || il >= (int) layers.size()) {
+                        continue;
+                    }
+                    auto & lay = layers[il];
+                    ggml_tensor * srcs[3] = { lay.ffn_up_exps, lay.ffn_gate_exps, lay.ffn_down_exps };
+                    if (!srcs[0] || !srcs[1] || !srcs[2]) {
+                        continue;
+                    }
+                    bool host = true;
+                    for (ggml_tensor * s : srcs) {
+                        host = host && s->buffer && ggml_backend_buffer_is_host(s->buffer) && s->data;
+                    }
+                    if (!host) {
+                        continue; // only RAM-resident (offloaded) experts benefit from the split
+                    }
+                    const int n_expert_t = (int) srcs[0]->ne[2];
+                    // validate and dedupe ids BEFORE trimming to n_hot: invalid ids
+                    // would leave VRAM slots uninitialized (Inf/NaN leaks through the merge)
+                    std::vector<int> ids_ok;
+                    {
+                        std::vector<bool> seen(n_expert_t, false);
+                        for (int g : ids) {
+                            if (g >= 0 && g < n_expert_t && !seen[g]) {
+                                seen[g] = true;
+                                ids_ok.push_back(g);
+                            }
+                        }
+                        if (ids_ok.size() != ids.size()) {
+                            LLAMA_LOG_WARN("%s: AIPC hot-list layer %d: %zu invalid/duplicate ids ignored\n",
+                                    __func__, il, ids.size() - ids_ok.size());
+                        }
+                    }
+                    const int n_hot = std::min(std::min(n_hot_req, (int) ids_ok.size()), n_expert_t);
+                    if (n_hot <= 0) {
+                        continue;
+                    }
+                    // n_pad ZEROED dummy slots (one per k position): cold positions on the
+                    // hot side point at unique slots, keeping ids unique per token (the
+                    // CUDA mul_mat_id kernel invariant) with no garbage reads
+                    const int n_pad = std::max(1, (int) hparams.n_expert_used);
+                    ggml_tensor * lookup = ggml_new_tensor_1d(ctx_hot, GGML_TYPE_F32, n_expert_t);
+                    ggml_tensor * mask   = ggml_new_tensor_1d(ctx_hot, GGML_TYPE_F32, n_expert_t);
+                    ggml_tensor * iota   = ggml_new_tensor_1d(ctx_hot, GGML_TYPE_F32, n_pad);
+                    ggml_format_name(lookup, "aipc_lookup-%d", il);
+                    ggml_format_name(mask,   "aipc_mask-%d",   il);
+                    ggml_format_name(iota,   "aipc_iota-%d",   il);
+                    for (int p = 0; p < 3; p++) {
+                        ggml_tensor * s   = srcs[p];
+                        ggml_tensor * hot = ggml_new_tensor_3d(ctx_hot, s->type, s->ne[0], s->ne[1], n_hot + n_pad);
+                        ggml_format_name(hot, "aipc_hot__%s", s->name);
+                        pending.push_back({ s, hot, lookup, mask, iota, n_pad, p == 0, { ids_ok.begin(), ids_ok.begin() + n_hot } });
+                    }
+                }
+
+                if (pending.empty()) {
+                    ggml_free(ctx_hot);
+                    LLAMA_LOG_INFO("%s: AIPC split: no eligible layer (experts not RAM-resident?)\n", __func__);
+                } else {
+                    ggml_backend_buffer_t buf_hot = ggml_backend_alloc_ctx_tensors_from_buft(ctx_hot, buft_gpu);
+                    if (buf_hot == nullptr) {
+                        ggml_free(ctx_hot);
+                        LLAMA_LOG_WARN("%s: AIPC split: failed to allocate GPU buffer - split disabled\n", __func__);
+                    } else {
+                        std::vector<uint8_t> zeros;
+                        for (auto & pe : pending) {
+                            const int n_hot = (int) pe.ids.size();
+                            for (int i = 0; i < n_hot; i++) {
+                                // ids already validated/deduped at parse time
+                                ggml_backend_tensor_set(pe.hot,
+                                        (const char *) pe.src->data + (size_t) pe.ids[i] * pe.src->nb[2],
+                                        (size_t) i * pe.hot->nb[2], pe.src->nb[2]);
+                            }
+                            // explicitly zero the dummy slots (recycled VRAM = garbage)
+                            zeros.assign(pe.hot->nb[2], 0);
+                            for (int i = 0; i < pe.n_pad; i++) {
+                                ggml_backend_tensor_set(pe.hot, zeros.data(),
+                                        (size_t) (n_hot + i) * pe.hot->nb[2], pe.hot->nb[2]);
+                            }
+                            if (pe.fill_tables) {
+                                // lookup stored as F32 (small ids, exact) so ggml_get_rows works in the graph
+                                std::vector<float> lk(pe.lookup->ne[0], 0.0f);
+                                std::vector<float> mk(pe.mask->ne[0], 0.0f);
+                                for (int i = 0; i < n_hot; i++) {
+                                    lk[pe.ids[i]] = (float) i;
+                                    mk[pe.ids[i]] = 1.0f;
+                                }
+                                std::vector<float> io(pe.n_pad);
+                                for (int i = 0; i < pe.n_pad; i++) {
+                                    io[i] = (float) (n_hot + i);
+                                }
+                                ggml_backend_tensor_set(pe.lookup, lk.data(), 0, lk.size() * sizeof(float));
+                                ggml_backend_tensor_set(pe.mask,   mk.data(), 0, mk.size() * sizeof(float));
+                                ggml_backend_tensor_set(pe.iota,   io.data(), 0, io.size() * sizeof(float));
+                            }
+                            aipc_moe_split_register(pe.src, { pe.hot, pe.lookup, pe.mask, pe.iota, n_hot, pe.n_pad });
+                        }
+                        const size_t vram_mb = ggml_backend_buffer_get_size(buf_hot) / 1024 / 1024;
+                        std::vector<ggml_backend_buffer_ptr> bufs_hot;
+                        bufs_hot.emplace_back(buf_hot);
+                        pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(ctx_hot), std::move(bufs_hot));
+                        LLAMA_LOG_INFO("%s: AIPC split: %zu hot tensors across %zu layers, %d experts/layer, %zu MiB of VRAM\n",
+                                __func__, pending.size(), pending.size() / 3, n_hot_req, vram_mb);
+                    }
+                }
+            }
         }
     }
 
