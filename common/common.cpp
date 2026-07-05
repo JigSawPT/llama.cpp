@@ -1178,6 +1178,27 @@ static void common_init_sampler_from_model(
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
+// portable "set environment variable" for the MoE hot-split bridge
+static void common_setenv(const char * name, const char * value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, /*overwrite=*/1);
+#endif
+}
+
+void common_set_moe_hot_env(const common_params & params) {
+    // Bridge the CLI flags to the env vars that the libllama load path reads (getenv in
+    // src/llama-model.cpp load_tensors). Only overwrite when the flag was actually set, so a
+    // value provided directly in the environment (the original interface) still works.
+    if (!params.moe_hot_list.empty()) {
+        common_setenv("AIPC_MOE_HOT_LIST", params.moe_hot_list.c_str());
+    }
+    if (params.moe_hot_n > 0) {
+        common_setenv("AIPC_MOE_HOT_N", std::to_string(params.moe_hot_n).c_str());
+    }
+}
+
 struct common_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -1195,6 +1216,10 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // Bridge --moe-hot-list / --moe-hot-n to the env vars libllama reads, BEFORE any model load
+    // (common_fit_params below also loads the model to estimate memory).
+    common_set_moe_hot_env(params);
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 

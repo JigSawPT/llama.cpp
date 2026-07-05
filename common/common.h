@@ -481,6 +481,15 @@ struct common_params {
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
 
+    // MoE hot/cold expert split (experimental): a per-layer hot-list file selects the
+    // most-activated experts to keep a VRAM copy of, so decode reads them from VRAM while
+    // the cold experts stay in RAM. See src/llama-model.cpp (load_tensors) and
+    // src/llama-graph.cpp (build_moe_ffn_split). These CLI values are bridged to the
+    // libllama load path via the AIPC_MOE_HOT_LIST / AIPC_MOE_HOT_N environment variables
+    // (env vars remain a backward-compatible fallback); see common_set_moe_hot_env().
+    std::string moe_hot_list = "";   // path to the per-layer hot-expert list ("il id id ..." per line)
+    int32_t     moe_hot_n    = 0;    // number of hot experts per layer to copy to VRAM (0 = validate only)
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 
@@ -904,6 +913,14 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+
+// Bridge the MoE hot-split CLI flags (--moe-hot-list / --moe-hot-n) to the libllama load
+// path, which reads its config from the AIPC_MOE_HOT_LIST / AIPC_MOE_HOT_N environment
+// variables (libllama does not see common_params). Only sets an env var when the matching
+// flag is non-empty/non-zero, so a value set directly in the environment still works as a
+// fallback. Must be called BEFORE the model is loaded. See the field comments in
+// common_params. (Cleaner follow-up: a dedicated llama_model_params field — see hardening.md.)
+void common_set_moe_hot_env(const common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);

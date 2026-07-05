@@ -361,6 +361,10 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    // MoE hot/cold expert split (experimental): load-time config, bridged to libllama via the
+    // AIPC_MOE_HOT_LIST / AIPC_MOE_HOT_N env vars. Single-valued (not a benchmark sweep axis).
+    std::string                      moe_hot_list;
+    int                              moe_hot_n;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -406,6 +410,8 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
+    /* moe_hot_list         */ "",
+    /* moe_hot_n            */ 0,
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -455,6 +461,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --poll <0...100>                            (default: %s)\n", join(cmd_params_defaults.poll, ",").c_str());
     printf("  -ngl, --n-gpu-layers <n>                    (default: %s)\n", join(cmd_params_defaults.n_gpu_layers, ",").c_str());
     printf("  -ncmoe, --n-cpu-moe <n>                     (default: %s)\n", join(cmd_params_defaults.n_cpu_moe, ",").c_str());
+    printf("  --moe-hot-list <path>                       (default: none; experimental MoE hot/cold split)\n");
+    printf("  --moe-hot-n <n>                             (default: %d; hot experts per layer to keep in VRAM)\n", cmd_params_defaults.moe_hot_n);
     printf("  -sm, --split-mode <none|layer|row|tensor>   (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                         (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
@@ -728,6 +736,18 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 params.n_cpu_moe.insert(params.n_cpu_moe.end(), p.begin(), p.end());
+            } else if (arg == "--moe-hot-list") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_hot_list = argv[i];
+            } else if (arg == "--moe-hot-n") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_hot_n = std::stoi(argv[i]);
             } else if (llama_supports_rpc() && (arg == "-rpc" || arg == "--rpc")) {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -2187,6 +2207,16 @@ int llama_bench(int argc, char ** argv) {
     ggml_backend_load_all();
 
     cmd_params params = parse_cmd_params(argc, argv);
+
+    // MoE hot/cold split (experimental): bridge --moe-hot-list / --moe-hot-n to the env vars the
+    // libllama load path reads (getenv in src/llama-model.cpp), BEFORE any model is loaded. Only
+    // set when the flag was given, so a value in the environment still works as a fallback.
+    {
+        common_params cp;
+        cp.moe_hot_list = params.moe_hot_list;
+        cp.moe_hot_n    = params.moe_hot_n;
+        common_set_moe_hot_env(cp);
+    }
 
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {

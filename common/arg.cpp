@@ -2477,6 +2477,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-hot-list"}, "PATH",
+        "MoE hot/cold split (experimental): per-layer hot-expert list file (\"il id id ...\" per line, "
+        "hot->cold order, as produced by the moe-profile example). Keeps a VRAM copy of the most-activated "
+        "experts so decode reads them from VRAM while cold experts stay in RAM. Requires --moe-hot-n > 0 and a GPU. "
+        "Bridged to the model loader via the AIPC_MOE_HOT_LIST env var (env var remains a fallback).",
+        [](common_params & params, const std::string & value) {
+            params.moe_hot_list = value;
+        }
+    ).set_env("AIPC_MOE_HOT_LIST"));
+    add_opt(common_arg(
+        {"--moe-hot-n"}, "N",
+        "MoE hot/cold split (experimental): number of hot experts per layer to copy to VRAM "
+        "(0 = read/validate the hot-list only, no split). See --moe-hot-list.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_hot_n = value;
+        }
+    ).set_env("AIPC_MOE_HOT_N"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
