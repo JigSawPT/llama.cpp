@@ -1683,6 +1683,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         __func__, hot_ids.size(), n_hot_req, dev_gpu ? "yes" : "no");
             } else {
                 ggml_backend_buffer_type_t buft_gpu = ggml_backend_dev_buffer_type(dev_gpu);
+                // TEST-ONLY (AIPC verification #1): force the hot-expert copies onto the CPU
+                // buffer type so the ENTIRE split (hot + cold chains) runs on the deterministic
+                // CPU backend, enabling a bit-exact sign-sensitive stock-vs-split FFN diff free
+                // of CUDA atomic-order noise. No effect on production (env unset). The compute
+                // graph is byte-identical; only the buffer placement of the hot copies changes.
+                if (const char * e = std::getenv("AIPC_HOT_BUFT_CPU"); e && atoi(e) != 0) {
+                    buft_gpu = ggml_backend_cpu_buffer_type();
+                    LLAMA_LOG_WARN("%s: AIPC split: TEST HOOK AIPC_HOT_BUFT_CPU set -> hot copies on CPU buffer (deterministic)\n", __func__);
+                }
 
                 struct aipc_pending {
                     ggml_tensor * src;
