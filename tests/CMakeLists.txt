@@ -240,6 +240,9 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
 endif()
 llama_build_and_test(test-gguf.cpp)
 llama_build_and_test(test-backend-ops.cpp)
+# AIPC: split-vs-baseline output-equality guard for the MoE hot/cold expert split.
+# Runs on every registered backend (CPU always; CUDA when built). ggml-only (no model file).
+llama_build_and_test(test-moe-hot-split.cpp)
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
