@@ -28,6 +28,12 @@ enum llama_fver {
 
 const char * llama_file_version_name(llama_fver version);
 
+// check if the buffer type of the given device supports op with the tensor as its weight
+bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev);
+
+// find the first buffer type in the list that can use the tensor
+ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list);
+
 struct llama_model_loader {
     // Holds information on a model weight
     struct llama_tensor_weight {
@@ -68,6 +74,24 @@ struct llama_model_loader {
     static const int TENSOR_SKIP            = 1 << 2;
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
+    static const int TENSOR_STREAMED        = 1 << 5;
+
+    // Two owners took bit 4 independently, and each was right on its own base:
+    // upstream's TENSOR_ALLOW_RESHAPE arrived with #26577, ours was written against
+    // b10223 where bit 4 was still free. Nothing caught it until the patch met the
+    // newer tree, as a merge conflict. This assertion turns the next such collision
+    // into a compile error, including one introduced by a later manual edit.
+    //
+    // OR == sum holds exactly when no two flags share a bit - the same statement
+    // std::popcount would make in C++20. This library is pinned to C++17
+    // ("don't bump", src/CMakeLists.txt:56), so the arithmetic identity does the work.
+    // A flag added later is only covered once it is listed here.
+    static_assert(
+        (TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED | TENSOR_SKIP | TENSOR_SKIP_IF_VIRTUAL |
+         TENSOR_ALLOW_RESHAPE | TENSOR_STREAMED) ==
+        (TENSOR_NOT_REQUIRED + TENSOR_DUPLICATED + TENSOR_SKIP + TENSOR_SKIP_IF_VIRTUAL +
+         TENSOR_ALLOW_RESHAPE + TENSOR_STREAMED),
+        "llama_model_loader tensor flags must use distinct bits");
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -83,6 +107,7 @@ struct llama_model_loader {
     bool load_mtp;
 
     llama_files files;
+    std::vector<std::string> file_paths; // same order as files; empty string for FILE*-based loading
     llama_ftype ftype;
     llama_fver  fver;
 

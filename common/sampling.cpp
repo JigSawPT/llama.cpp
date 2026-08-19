@@ -565,6 +565,22 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         LOG_INF("%s:    graphs reused = %10d\n", __func__, data.n_reused);
 
         common_memory_breakdown_print(ctx);
+
+        // Expert-streaming statistics, printed AFTER common_memory_breakdown_print and
+        // not in front of it, where upstream PR #25294 places them. The per-token series
+        // above wants that same anchor, and two independent inserts at one base line
+        // cannot be split across two patches that each have to apply on their own:
+        // measured 2026-08-05, sharing it left a conflict in all six orders. Both still
+        // print, because the series explains the shape of a token's time while these
+        // stats explain how much of it went on fetching experts, and reading one without
+        // the other is how a stall gets blamed on the wrong tier. No-op while streaming
+        // is off.
+        //
+        // No role here, deliberately. This path runs in the single-model tools (llama-completion,
+        // llama-tts), which have exactly one streaming model, and a NULL role prints the block
+        // unchanged - the same bytes these tools printed before the server needed labels. The
+        // label belongs where two instances share one log, which is the server.
+        llama_moe_stream_print_stats(llama_get_model(ctx), NULL);
     }
 }
 

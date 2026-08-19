@@ -674,6 +674,28 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        // MoE expert streaming counters, one block per model instance. THIS IS THE ONLY PLACE
+        // IN THE SERVER THEY CAN BE PRINTED, and the reason is a lock: print_stats takes the
+        // same mutex as the expert remap, and the remap runs inside a custom op during
+        // llama_decode - which this server calls from exactly one place, on this thread. Here
+        // the decode has returned and the slot is finished, so the lock is uncontended and no
+        // request is delayed. Printing from anywhere that can overlap a decode would stall the
+        // stream instead of measuring it.
+        //
+        // The counters are CUMULATIVE over the model instance, i.e. over the server process,
+        // and nothing here resets them: a request-local figure is the difference between two
+        // consecutive blocks. The discarded warm-up request is therefore still contained in
+        // every later block and has to be subtracted, not assumed away. A restarted server
+        // starts from zero because the model instance is new.
+        //
+        // Two calls, because target and draft model each own a manager (llama-model.cpp) and
+        // their misses, stalls and locality are the two numbers the streaming question needs
+        // apart. The role token is what separates them in the log; the order is not a contract.
+        llama_moe_stream_print_stats(llama_get_model(ctx_tgt), "target");
+        if (ctx_dft) {
+            llama_moe_stream_print_stats(llama_get_model(ctx_dft), "drafter");
+        }
     }
 
     json to_json(bool only_metrics = false) const {
