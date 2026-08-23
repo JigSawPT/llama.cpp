@@ -1,5 +1,7 @@
 #include "llama-model.h"
 
+#include "ggml-cpu.h"
+
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
@@ -34,6 +36,7 @@
 #include <numeric>
 #include <regex>
 #include <sstream>
+#include <fstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -1667,6 +1670,123 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    // ----- JigSaw Teaming v2 (22/08): copias RESIDENTES em VRAM dos experts quentes -----
+    // A GPU computa os quentes de copias em VRAM (1,8 TB/s) enquanto a CPU computa so os
+    // frios da DDR5 - as larguras somam DE VERDADE porque o original fica no host e nada
+    // atravessa o PCIe no decode. Env: LLAMA_TEAMING_HOT_N + LLAMA_TEAMING_HOT_LIST
+    // (formato: "camada id id id ..." por linha). Ver external/TEAMING_V2_DESIGN.md.
+    if (const char * thn = std::getenv("LLAMA_TEAMING_HOT_N")) {
+        const int hot_n = atoi(thn);
+        const char * thl = std::getenv("LLAMA_TEAMING_HOT_LIST");
+        ggml_backend_dev_t tgpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (hot_n > 0 && thl && tgpu) {
+            std::map<int, std::vector<int>> quentes;
+            {
+                std::ifstream f(thl);
+                std::string ln;
+                while (std::getline(f, ln)) {
+                    std::istringstream iss(ln);
+                    int lil, id;
+                    if (!(iss >> lil)) continue;
+                    auto & v = quentes[lil];
+                    while ((int) v.size() < hot_n && (iss >> id)) v.push_back(id);
+                }
+            }
+            int n_moe = 0;
+            for (auto & l : layers) if (l.ffn_up_exps && l.ffn_down_exps) n_moe++;
+            if (n_moe > 0 && !quentes.empty()) {
+                ggml_init_params tip = {
+                    /*.mem_size   =*/ ggml_tensor_overhead()*(size_t)(n_moe*5 + 1),
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context * tctx = ggml_init(tip);
+                const uint32_t n_exp = hparams.n_expert;
+                for (size_t il = 0; il < layers.size(); il++) {
+                    auto & l = layers[il];
+                    auto it = quentes.find((int) il);
+                    if (!l.ffn_up_exps || !l.ffn_down_exps || it == quentes.end()) continue;
+                    if ((int) it->second.size() < hot_n) continue;
+                    // A1.1 do review (23/08): camadas com experts JA RESIDENTES na GPU nao
+                    // levam teaming - copiar VRAM para VRAM e desperdicio, e a cadeia
+                    // "fria" com ids -1 correria no MMVQ da GPU, que le -1 como
+                    // UINT32_MAX -> OOB nao-determinista (a corrupcao do Step).
+                    if (l.ffn_up_exps->buffer &&
+                        !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(l.ffn_up_exps->buffer))) {
+                        continue;
+                    }
+                    auto faz = [&](ggml_tensor * src) {
+                        ggml_tensor * t = ggml_new_tensor_3d(tctx, src->type, src->ne[0], src->ne[1], hot_n);
+                        ggml_format_name(t, "%s.jigsaw_hot", src->name);
+                        return t;
+                    };
+                    l.teaming_up_hot   = faz(l.ffn_up_exps);
+                    l.teaming_gate_hot = l.ffn_gate_exps ? faz(l.ffn_gate_exps) : nullptr;
+                    l.teaming_down_hot = faz(l.ffn_down_exps);
+                    l.teaming_is_hot   = ggml_new_tensor_2d(tctx, GGML_TYPE_F32, 1, n_exp);
+                    l.teaming_remap    = ggml_new_tensor_2d(tctx, GGML_TYPE_I32, 1, n_exp);
+                    l.teaming_dummy_hot = it->second[0];
+                }
+                ggml_backend_buffer_type_t tbuft = ggml_backend_dev_buffer_type(tgpu);
+                ggml_backend_buffer_t tbuf = ggml_backend_alloc_ctx_tensors_from_buft(tctx, tbuft);
+                if (tbuf == nullptr) {
+                    LLAMA_LOG_WARN("%s: JigSaw teaming: sem VRAM para as copias quentes - desligado\n", __func__);
+                    for (auto & l : layers) {
+                        l.teaming_up_hot = l.teaming_gate_hot = l.teaming_down_hot = nullptr;
+                        l.teaming_is_hot = l.teaming_remap = nullptr;
+                        l.teaming_dummy_hot = -1;
+                    }
+                    ggml_free(tctx);
+                } else {
+                    std::vector<uint8_t> palco;
+                    std::vector<float>   vhot(n_exp);
+                    std::vector<int32_t> vmap(n_exp);
+                    int camadas = 0;
+                    for (size_t il = 0; il < layers.size(); il++) {
+                        auto & l = layers[il];
+                        if (!l.teaming_up_hot) continue;
+                        auto & ids = quentes[(int) il];
+                        auto copia = [&](ggml_tensor * dst, ggml_tensor * src) {
+                            const size_t nbe = src->nb[2]; // bytes por expert
+                            if (palco.size() < nbe) palco.resize(nbe);
+                            for (int s = 0; s < hot_n; s++) {
+                                ggml_backend_tensor_get(src, palco.data(), (size_t) ids[s]*nbe, nbe);
+                                ggml_backend_tensor_set(dst, palco.data(), (size_t) s*dst->nb[2], nbe);
+                            }
+                        };
+                        copia(l.teaming_up_hot,   l.ffn_up_exps);
+                        if (l.teaming_gate_hot) copia(l.teaming_gate_hot, l.ffn_gate_exps);
+                        copia(l.teaming_down_hot, l.ffn_down_exps);
+                        std::fill(vhot.begin(), vhot.end(), 0.0f);
+                        std::fill(vmap.begin(), vmap.end(), 0);
+                        for (int s = 0; s < hot_n; s++) {
+                            vhot[ids[s]] = 1.0f;
+                            vmap[ids[s]] = s;
+                        }
+                        ggml_backend_tensor_set(l.teaming_is_hot, vhot.data(), 0, n_exp*sizeof(float));
+                        ggml_backend_tensor_set(l.teaming_remap,  vmap.data(), 0, n_exp*sizeof(int32_t));
+                        l.teaming_hot_ids.assign(ids.begin(), ids.begin() + hot_n);
+                        l.teaming_dummy_cold = -1;
+                        for (uint32_t e = 0; e < n_exp; e++) {
+                            if (vhot[e] == 0.0f) { l.teaming_dummy_cold = (int32_t) e; break; }
+                        }
+                        if (l.teaming_dummy_cold < 0) {
+                            // tudo quente = nao ha divisao para fazer; desliga a camada
+                            l.teaming_up_hot = l.teaming_gate_hot = l.teaming_down_hot = nullptr;
+                        }
+                        camadas++;
+                    }
+                    std::vector<ggml_backend_buffer_ptr> tbufs;
+                    tbufs.emplace_back(tbuf);
+                    pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(tctx), std::move(tbufs));
+                    ggml_jigsaw_contar_set(true); // v2.1: contagem de rotas no prefill
+                    LLAMA_LOG_WARN("%s: JigSaw teaming: %d camadas com %d experts quentes em VRAM (%.1f MiB)\n",
+                            __func__, camadas, hot_n, ggml_backend_buffer_get_size(tbuf)/1024.0/1024.0);
+                }
+            }
         }
     }
 

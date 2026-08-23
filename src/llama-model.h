@@ -322,6 +322,20 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_exps     = nullptr;
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
+
+    // JigSaw Teaming v2 (22/08): copias RESIDENTES em VRAM dos N experts mais quentes da
+    // camada, mais as tabelas de encaminhamento. null = teaming desligado nesta camada.
+    // As copias somam largura de banda de verdade (VRAM 1,8 TB/s + DDR5) porque o original
+    // fica no host e a GPU nunca atravessa o PCIe no decode. Ver TEAMING_V2_DESIGN.md.
+    struct ggml_tensor * teaming_up_hot    = nullptr; // [k, m, hot_n] em VRAM
+    struct ggml_tensor * teaming_gate_hot  = nullptr;
+    struct ggml_tensor * teaming_down_hot  = nullptr;
+    struct ggml_tensor * teaming_is_hot    = nullptr; // [1, n_expert] F32: 1=quente
+    struct ggml_tensor * teaming_remap     = nullptr; // [1, n_expert] I32: id -> slot quente (0 se frio)
+    int32_t              teaming_dummy_hot = -1;      // um id quente qualquer (para os frios apontarem)
+    int32_t              teaming_dummy_cold = -1;     // um id frio qualquer (para os quentes apontarem)
+    std::vector<int32_t> teaming_hot_ids;            // espelho CPU do hot-set actual, por slot (v2.1)
+
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;

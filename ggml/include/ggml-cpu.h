@@ -34,6 +34,13 @@ extern "C" {
         GGML_NUMA_STRATEGY_COUNT
     };
 
+    // JigSaw v2.1 (23/08): contagem de rotas de experts dentro do mul_mat_id da CPU.
+    // Sempre ligada quando activada; custo ~zero (os ids ja estao no host; a camada sai
+    // do nome do tensor "blk.N."). O refresher em llama-context le e decai.
+    GGML_BACKEND_API void ggml_jigsaw_contar_set(bool on);
+    GGML_BACKEND_API void ggml_jigsaw_rotas_snapshot(int64_t * dst, int n_layers, int n_experts);
+    GGML_BACKEND_API void ggml_jigsaw_rotas_meia_vida(void);
+
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 

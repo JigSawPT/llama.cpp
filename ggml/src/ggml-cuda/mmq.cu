@@ -261,6 +261,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
 
+    // JigSaw (23/08): o caminho de quantizacao do MMQ (quantize_scatter_mmq_fp4) rebenta
+    // com illegal access em tensores de POUCOS experts (as copias quentes do teaming, 8-12
+    // slots) a batch >= ~14 - diagnostico sincrono em reports/smoke_crashdiag.serverlog.
+    // Com tao poucos experts a GEMM e minuscula e o fallback nao custa nada; os modelos
+    // normais (32+ experts) ficam intocados. Root-cause por cacar a montante.
+    if (n_experts > 0 && n_experts <= 16) {
+        return false;
+    }
+
     bool mmq_supported;
 
     switch (type) {

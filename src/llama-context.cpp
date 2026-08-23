@@ -9,6 +9,9 @@
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "ggml-cpu.h"
+
+#include <algorithm>
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -1632,7 +1635,85 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// ----- JigSaw v2.1 (23/08): refresh adaptativo das copias quentes -----
+// A cada N tokens de decode, re-ranqueia os contadores de rotas (colhidos no PREFILL,
+// nao-enviesados) e troca ate 4 experts por camada nas copias de VRAM + tabelas.
+// Corre no inicio de decode() - sincrono, nenhum grafo em voo. Env: LLAMA_TEAMING_ADAPT=1.
+static void llama_jigsaw_adapta(const llama_model & model_c) {
+    llama_model & model = const_cast<llama_model &>(model_c); // fork: mutacao deliberada das copias
+    const int n_exp = (int) model.hparams.n_expert;
+    static std::vector<int64_t> rotas;
+    rotas.assign((size_t) 96 * n_exp, 0);
+    ggml_jigsaw_rotas_snapshot(rotas.data(), 96, n_exp);
+
+    int trocas_tot = 0;
+    std::vector<uint8_t> palco;
+    for (size_t il = 0; il < model.layers.size(); il++) {
+        auto & l = model.layers[il];
+        if (!l.teaming_up_hot || l.teaming_hot_ids.empty() || il >= 96) { continue; }
+        const int hot_n = (int) l.teaming_hot_ids.size();
+        const int64_t * r = rotas.data() + il * n_exp;
+        // top hot_n por contagem
+        std::vector<int> ordem(n_exp);
+        for (int e = 0; e < n_exp; e++) { ordem[e] = e; }
+        std::partial_sort(ordem.begin(), ordem.begin() + hot_n, ordem.end(),
+                          [&](int a, int b) { return r[a] > r[b]; });
+        std::vector<char> quer(n_exp, 0);
+        for (int k = 0; k < hot_n; k++) { quer[ordem[k]] = 1; }
+        // trocas: slots cujo ocupante saiu do top, preenchidos pelos novos por ordem
+        std::vector<int> entram;
+        for (int k = 0; k < hot_n; k++) {
+            int e = ordem[k];
+            bool ja = false;
+            for (int sN = 0; sN < hot_n; sN++) { if (l.teaming_hot_ids[sN] == e) { ja = true; break; } }
+            if (!ja) { entram.push_back(e); }
+        }
+        int trocas = 0;
+        auto copia_slot = [&](ggml_tensor * dst, ggml_tensor * src, int e, int slot) {
+            const size_t nbe = src->nb[2];
+            if (palco.size() < nbe) { palco.resize(nbe); }
+            ggml_backend_tensor_get(src, palco.data(), (size_t) e * nbe, nbe);
+            ggml_backend_tensor_set(dst, palco.data(), (size_t) slot * dst->nb[2], nbe);
+        };
+        for (int slot = 0; slot < hot_n && !entram.empty() && trocas < 4; slot++) {
+            const int e_actual = l.teaming_hot_ids[slot];
+            if (quer[e_actual]) { continue; } // fica
+            const int e_novo = entram.back(); entram.pop_back();
+            copia_slot(l.teaming_up_hot,   l.ffn_up_exps,   e_novo, slot);
+            if (l.teaming_gate_hot) { copia_slot(l.teaming_gate_hot, l.ffn_gate_exps, e_novo, slot); }
+            copia_slot(l.teaming_down_hot, l.ffn_down_exps, e_novo, slot);
+            l.teaming_hot_ids[slot] = e_novo;
+            trocas++;
+        }
+        if (trocas > 0) {
+            // tabelas novas por inteiro (pequenas)
+            std::vector<float>   vhot(n_exp, 0.0f);
+            std::vector<int32_t> vmap(n_exp, 0);
+            for (int sN = 0; sN < hot_n; sN++) {
+                vhot[l.teaming_hot_ids[sN]] = 1.0f;
+                vmap[l.teaming_hot_ids[sN]] = sN;
+            }
+            ggml_backend_tensor_set(l.teaming_is_hot, vhot.data(), 0, (size_t) n_exp * sizeof(float));
+            ggml_backend_tensor_set(l.teaming_remap,  vmap.data(), 0, (size_t) n_exp * sizeof(int32_t));
+            l.teaming_dummy_hot = l.teaming_hot_ids[0];
+            trocas_tot += trocas;
+        }
+    }
+    ggml_jigsaw_rotas_meia_vida(); // decaimento: o passado pesa metade a cada refresh
+    if (trocas_tot > 0) {
+        LLAMA_LOG_WARN("JigSaw v2.1: refresh adaptativo trocou %d experts quentes\n", trocas_tot);
+    }
+}
+
 int llama_context::decode(const llama_batch & batch_inp) {
+    if (std::getenv("LLAMA_TEAMING_ADAPT")) {
+        static int64_t jt_tokens = 0;
+        jt_tokens += batch_inp.n_tokens;
+        if (jt_tokens >= 256) {
+            jt_tokens = 0;
+            llama_jigsaw_adapta(model);
+        }
+    }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);

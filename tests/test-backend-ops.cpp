@@ -8854,6 +8854,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  3, 2592, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1700000,  1, 2592, {1, 1}, {1, 1}));
 
+    // JigSaw (22/08): geometria REAL do REAP-150B MXFP4 (blk.N.ffn_up_exps 4096x2048x132,
+    // 6 usados). n=1 e o decode; n=512 o prefill. Q4_K ao lado = candidato a copia quente
+    // convertida; IQ3_XXS = o quant do vendor que preenche a referencia.
+    for (ggml_type ta : {GGML_TYPE_MXFP4, GGML_TYPE_Q4_K, GGML_TYPE_IQ3_XXS}) {
+        for (int64_t nn : {1, 8, 32, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 132, 6, false, 2048, nn, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(ta, GGML_TYPE_F32, 132, 6, false, 4096, nn, 2048));
+        }
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 2, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));

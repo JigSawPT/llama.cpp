@@ -1451,6 +1451,37 @@ UseGgmlGemm2:;
     }
 }
 
+// JigSaw v2.1: contadores de rotas por (camada, expert). Corridas de dados sao BENIGNAS
+// aqui (estatistica de encaminhamento, nao contabilidade) - somas simples sem atomicos.
+#define GGML_JIGSAW_MAX_LAYERS 96
+#define GGML_JIGSAW_MAX_EXPERTS 320
+static volatile int g_jigsaw_contar = 0;
+static int64_t g_jigsaw_rotas[GGML_JIGSAW_MAX_LAYERS][GGML_JIGSAW_MAX_EXPERTS];
+
+void ggml_jigsaw_contar_set(bool on) { g_jigsaw_contar = on ? 1 : 0; }
+
+void ggml_jigsaw_rotas_snapshot(int64_t * dst, int n_layers, int n_experts) {
+    for (int l = 0; l < n_layers && l < GGML_JIGSAW_MAX_LAYERS; l++) {
+        for (int e = 0; e < n_experts && e < GGML_JIGSAW_MAX_EXPERTS; e++) {
+            dst[l*n_experts + e] = g_jigsaw_rotas[l][e];
+        }
+    }
+}
+
+void ggml_jigsaw_rotas_meia_vida(void) {
+    for (int l = 0; l < GGML_JIGSAW_MAX_LAYERS; l++) {
+        for (int e = 0; e < GGML_JIGSAW_MAX_EXPERTS; e++) {
+            g_jigsaw_rotas[l][e] >>= 1;
+        }
+    }
+}
+
+// camada a partir do nome do tensor de pesos ("blk.17.ffn_up_exps.weight"); -1 se nao der
+static int ggml_jigsaw_layer_do_nome(const char * nome) {
+    if (nome == NULL || strncmp(nome, "blk.", 4) != 0) { return -1; }
+    return atoi(nome + 4);
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1623,12 +1654,35 @@ static void ggml_compute_forward_mul_mat_id(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        // JigSaw v2.1: contar rotas SO NO PREFILL (n_tokens>1): no decode a cadeia fria
+        // ve ids mascarados (quentes -> -1) e contar ai ensinaria o adaptador a despejar
+        // exactamente os experts que estao a pagar. O prefill usa o caminho normal com
+        // ids originais - sinal nao-enviesado, e chega no momento em que o workload muda.
+        if (g_jigsaw_contar && ids->ne[1] > 1) {
+            const int jl = ggml_jigsaw_layer_do_nome(src0->name);
+            if (jl >= 0 && jl < GGML_JIGSAW_MAX_LAYERS) {
+                for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                    for (int id = 0; id < n_ids; ++id) {
+                        const int32_t e = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
+                        if (e >= 0 && e < GGML_JIGSAW_MAX_EXPERTS) { g_jigsaw_rotas[jl][e]++; }
+                    }
+                }
+            }
+        }
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                // JigSaw (23/08): id negativo = posicao saltada (a outra cadeia trata dela).
+                // A linha do dst e zerada AQUI porque o combinador multiplica por 0 e
+                // 0*NaN=NaN - lixo nao mascarado corromperia o resultado.
+                if (i02 < 0) {
+                    memset((char *) dst->data + iid1*nb2 + id*nb1, 0, ne0*sizeof(float));
+                    continue;
+                }
+                assert(i02 < n_as);
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
                 matrix_row_counts[i02] += 1;

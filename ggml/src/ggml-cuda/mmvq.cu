@@ -513,7 +513,10 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
-    channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
+    // JigSaw (23/08, review A1.1): id negativo = posicao saltada. Clamp para 0: le o
+    // expert 0 (memoria valida, valor FINITO) em vez de OOB em 0xFFFFFFFF; o valor e
+    // aniquilado pela mascara x0 a jusante - lixo OOB podia ser NaN e NaN*0=NaN.
+    channel_x  = ncols_dst == 1 && ids ? (ids[channel_dst] < 0 ? 0u : (uint32_t) ids[channel_dst]) : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
@@ -737,7 +740,8 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
-    const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+    const int32_t jig_cx = ids[channel_dst + token_idx * ids_stride];
+    const uint32_t channel_x = jig_cx < 0 ? 0u : (uint32_t) jig_cx; // JigSaw: -1 -> expert 0, mascarado a jusante
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;

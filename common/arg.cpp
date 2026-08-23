@@ -259,6 +259,12 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // JigSaw Teaming (22/08): expor tambem o host buffer (RAM pinada, p.ex. CUDA_Host)
+        // como alvo de -ot - a enumeracao original so via o buffer por-dispositivo.
+        auto * hbuft = ggml_backend_dev_host_buffer_type(dev);
+        if (hbuft) {
+            buft_list[ggml_backend_buft_name(hbuft)] = hbuft;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {

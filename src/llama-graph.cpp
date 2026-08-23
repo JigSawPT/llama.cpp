@@ -15,6 +15,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1868,6 +1869,42 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// JigSaw v2: contadores por-(camada, expert) do encaminhamento VIVO (LLAMA_TEAMING_DEBUG=1).
+// A cobertura da hotlist do corpus mediu 10,9-20,2% em runtime (fumo 10b, 22/08) - a lista
+// nova deriva-se DESTES contadores. Dump periodico para reports/live_expert_counts.tsv.
+static void llama_jigsaw_conta_rotas(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * ud) {
+    if (ith != 0) { return; }
+    const int64_t n = ggml_nelements(a);
+    const int32_t * ids = (const int32_t *) a->data;
+    int32_t * y = (int32_t *) dst->data;
+    const int il = (int) (intptr_t) ud;
+    static std::atomic<int64_t> contas[96][320];
+    static std::atomic<int64_t> chamadas{0};
+    for (int64_t i = 0; i < n; i++) {
+        y[i] = ids[i];
+        if (il >= 0 && il < 96 && ids[i] >= 0 && ids[i] < 320) {
+            contas[il][ids[i]]++;
+        }
+    }
+    const int64_t c = ++chamadas;
+    if (c % 4300 == 0) {
+        FILE * f = fopen("reports/live_expert_counts.tsv", "w");
+        if (f) {
+            for (int l = 0; l < 96; l++) {
+                int64_t tot = 0;
+                for (int e = 0; e < 320; e++) tot += contas[l][e].load();
+                if (tot == 0) continue;
+                fprintf(f, "%d", l);
+                for (int e = 0; e < 320; e++) fprintf(f, "\t%lld", (long long) contas[l][e].load());
+                fprintf(f, "\n");
+            }
+            fclose(f);
+            LLAMA_LOG_WARN("JigSaw v2: contadores de rotas despejados (%lld chamadas)\n", (long long) c);
+        }
+    }
+}
+
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2085,6 +2122,142 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    // ----- JigSaw Teaming v2 (22/08): divisao quentes(VRAM)/frios(CPU) em paralelo -----
+    // As copias quentes vivem em VRAM; o tensor original fica no host. Cada GEMM de
+    // experts corre DUAS vezes - a quente le so as copias (ids frios apontam a um dummy
+    // quente com mascara 0), a fria le so o host (ids quentes -> dummy frio, custo de um
+    // expert residente em RAM por camada) - e as saidas somam-se mascaradas. O resto do
+    // grafo (pesos, bias por id, agregacao) fica intocado. Ver TEAMING_V2_DESIGN.md.
+    ggml_tensor * jt_mask3   = nullptr;
+    ggml_tensor * jt_inv3    = nullptr;
+    ggml_tensor * jt_ids_hot = nullptr;
+    ggml_tensor * jt_ids_cold = nullptr;
+    const llama_layer * jt = teaming_layer;
+    // 23/08, fumos 13-17: o teaming e uma optimizacao de DECODE. No prefill o ganho das
+    // copias e ~6% (o lote toca quase todos os experts) e os caminhos MMQ/upload assumem
+    // ids unicos por token - garantia do top-k que a substituicao por dummy quebra
+    // (quantize_scatter: illegal access). Prefill fica no caminho normal, intocado.
+    if (n_tokens == 1 &&
+        jt && jt->teaming_up_hot && jt->teaming_down_hot && jt->teaming_dummy_cold >= 0 &&
+        !gate_up_exps && !weight_before_ffn) {
+        // get_rows com indices 2D exige tabela por-token (a->ne[2]==b->ne[1]); a nossa
+        // tabela e constante por camada, por isso achata-se os ids para 1D e repoe-se
+        // a forma a seguir (licao do fumo de 22/08, GGML_ASSERT em ggml.c:3895).
+        // o selected_experts e uma VIEW do top-k - reshape/cast exigem contiguidade
+        ggml_tensor * ids_c = ggml_cont(ctx0, selected_experts);
+        if (std::getenv("LLAMA_TEAMING_DEBUG")) {
+            ids_c = ggml_map_custom1(ctx0, ids_c, llama_jigsaw_conta_rotas, 1, (void *)(intptr_t) il);
+        }
+        ggml_tensor * ids_flat = ggml_reshape_1d(ctx0, ids_c, n_expert_used*n_tokens);
+        ggml_tensor * m1 = ggml_get_rows(ctx0, jt->teaming_is_hot, ids_flat); // [1, u*t] F32
+        ggml_tensor * m3 = ggml_reshape_3d(ctx0, m1, 1, n_expert_used, n_tokens);
+        jt_mask3 = m3;
+        jt_inv3  = ggml_scale_bias(ctx0, m3, -1.0f, 1.0f);
+        ggml_tensor * m2  = ggml_reshape_2d(ctx0, m3, n_expert_used, n_tokens);
+        ggml_tensor * i2  = ggml_scale_bias(ctx0, m2, -1.0f, 1.0f);
+        ggml_tensor * idf = ggml_cast(ctx0, ids_c, GGML_TYPE_F32);
+        // quentes: id*m + dummy_hot*(1-m) = m*(id - dummy_hot) + dummy_hot; depois id->slot
+        ggml_tensor * ih = ggml_scale_bias(ctx0,
+                ggml_mul(ctx0, ggml_scale_bias(ctx0, idf, 1.0f, (float) -jt->teaming_dummy_hot), m2),
+                1.0f, (float) jt->teaming_dummy_hot);
+        ggml_tensor * ih_i  = ggml_cast(ctx0, ih, GGML_TYPE_I32);
+        ggml_tensor * ih_1d = ggml_reshape_1d(ctx0, ih_i, n_expert_used*n_tokens);
+        ggml_tensor * rem = ggml_get_rows(ctx0, jt->teaming_remap, ih_1d); // [1, u*t] I32
+        jt_ids_hot = ggml_reshape_2d(ctx0, rem, n_expert_used, n_tokens);
+        // frios (23/08): DUAS formulas conforme o tamanho do lote, porque o grafo e
+        // reconstruido por classe de ubatch:
+        //  - decode (n_tokens==1): quentes -> -1 = posicao SALTADA (patch nosso no CPU e
+        //    no sched). Mata o imposto do dummy (+1 expert/camada, ~17% dos bytes frios,
+        //    metade do ganho do v2 - 2.33/2.35: +25% medido).
+        //  - prefill (n_tokens>1): quentes -> dummy_cold VALIDO. O imposto e nulo num lote
+        //    que toca quase todos os experts, e os caminhos MMQ/upload do prefill nao
+        //    conhecem -1 (o quantize_scatter rebentava com illegal access - fumos 13-16).
+        ggml_tensor * ic;
+        if (n_tokens == 1) {
+            // ic = id*(1-m) + (-1)*m = id - (id+1)*m
+            ic = ggml_sub(ctx0, idf,
+                    ggml_mul(ctx0, ggml_scale_bias(ctx0, idf, 1.0f, 1.0f), m2));
+        } else {
+            // ic = (id - dc)*(1-m) + dc
+            ic = ggml_scale_bias(ctx0,
+                    ggml_mul(ctx0, ggml_scale_bias(ctx0, idf, 1.0f, (float) -jt->teaming_dummy_cold), i2),
+                    1.0f, (float) jt->teaming_dummy_cold);
+        }
+        jt_ids_cold = ggml_cast(ctx0, ic, GGML_TYPE_I32);
+    }
+
+
+    // Fumo 5 (22/08, 8,94 t/s = 2x pior): dividir POR GEMM criava 4 travessias GPU<->CPU
+    // por camada contra 2 do baseline - a activacao combinada obrigava o frio a voltar a
+    // GPU a meio. Correccao: CADEIAS COMPLETAS - o frio faz up->gate->swiglu->down inteiro
+    // na CPU (regiao contigua, 2 travessias), o quente faz tudo na GPU, e a mascara
+    // combina UMA vez no fim. swiglu e clamp sao elementwise: comutam com a mascara.
+    if (jt && il == 0) {
+        // prova de activacao (licao do pinning, 2.26.1): sem isto um guard falhado
+        // devolve o caminho normal em silencio e o braco mede o baseline sem saber.
+        LLAMA_LOG_WARN("JigSaw v2 layer0: ids=%d silu=%d gate=%d ghot=%d b=%d%d%d s=%d%d%d gup=%d\n",
+                jt_ids_hot != nullptr, type_op == LLM_FFN_SILU, gate_exps != nullptr,
+                jt->teaming_gate_hot != nullptr, !up_exps_b, !gate_exps_b, !down_exps_b,
+                !up_exps_s, !gate_exps_s, !down_exps_s, !gate_up_exps);
+    }
+    if (jt_ids_hot && type_op == LLM_FFN_SILU && gate_exps && jt->teaming_gate_hot &&
+        !up_exps_b && !gate_exps_b && !down_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s && !gate_up_exps) {
+        const float jt_limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+        constexpr float jt_eps = 1e-6f;
+        const bool jt_clamp_split = jt_limit > jt_eps &&
+            (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0));
+
+        auto jt_ffn = [&](ggml_tensor * w_up, ggml_tensor * w_gate, ggml_tensor * w_down,
+                          ggml_tensor * ids, bool lora) -> ggml_tensor * {
+            ggml_tensor * u = lora ? build_lora_mm_id(w_up,   cur, ids, nullptr)
+                                   : ggml_mul_mat_id(ctx0, w_up,   cur, ids);
+            ggml_tensor * g = lora ? build_lora_mm_id(w_gate, cur, ids, nullptr)
+                                   : ggml_mul_mat_id(ctx0, w_gate, cur, ids);
+            ggml_tensor * a;
+            if (jt_limit > jt_eps) {
+                u = ggml_clamp(ctx0, u, -jt_limit, jt_limit);
+                if (jt_clamp_split) {
+                    g = ggml_clamp(ctx0, g, -INFINITY, jt_limit);
+                    a = ggml_swiglu_split(ctx0, g, u);
+                } else {
+                    ggml_tensor * ga = ggml_silu(ctx0, g);
+                    ga = ggml_clamp(ctx0, ga, -INFINITY, jt_limit);
+                    a = ggml_mul(ctx0, ga, u);
+                }
+            } else {
+                a = ggml_swiglu_split(ctx0, g, u);
+            }
+            return lora ? build_lora_mm_id(w_down, a, ids, nullptr)
+                        : ggml_mul_mat_id(ctx0, w_down, a, ids);
+        };
+        ggml_tensor * oh = jt_ffn(jt->teaming_up_hot, jt->teaming_gate_hot, jt->teaming_down_hot,
+                                  jt_ids_hot, false);
+        ggml_tensor * oc = jt_ffn(up_exps, gate_exps, down_exps, jt_ids_cold, true);
+        // combinar uma vez: oc + (oh - oc)*m
+        ggml_tensor * experts_jt = ggml_add(ctx0, oc,
+                ggml_mul(ctx0, ggml_sub(ctx0, oh, oc), jt_mask3));
+        experts_jt = ggml_mul(ctx0, experts_jt, weights);
+        cb(experts_jt, "ffn_moe_weighted_jigsaw", il);
+        ggml_build_forward_expand(gf, experts_jt);
+
+        ggml_tensor * jt_views[LLAMA_MAX_EXPERTS] = { nullptr };
+        for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+            jt_views[i] = ggml_view_2d(ctx0, experts_jt, n_embd, n_tokens,
+                                       experts_jt->nb[2], i*experts_jt->nb[1]);
+            ggml_build_forward_expand(gf, jt_views[i]);
+        }
+        ggml_tensor * jt_out = jt_views[0];
+        for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+            jt_out = ggml_add(ctx0, jt_out, jt_views[i]);
+            ggml_build_forward_expand(gf, jt_out);
+        }
+        if (hparams.n_expert_used == 1) {
+            jt_out = ggml_cont(ctx0, jt_out);
+        }
+        cb(jt_out, "ffn_moe_out_jigsaw", il);
+        return jt_out;
+    }
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 

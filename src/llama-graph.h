@@ -947,6 +947,11 @@ struct llm_graph_qkv {
 };
 
 struct llm_graph_context {
+    // JigSaw Teaming v2 (22/08): a camada corrente quando tem copias quentes em VRAM.
+    // O builder da arquitectura aponta-a antes de build_moe_ffn e limpa-a depois; e
+    // mutable porque os builders sao const e isto e so um canal lateral de contexto.
+    mutable const struct llama_layer * teaming_layer = nullptr;
+
     const llm_arch arch;
 
     const llama_hparams & hparams;

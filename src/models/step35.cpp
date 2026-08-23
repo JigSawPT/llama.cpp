@@ -312,6 +312,7 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
             cb(cur, "ffn_out", il);
         } else {
             // MoE routed experts
+            teaming_layer = model.layers[il].teaming_up_hot ? &model.layers[il] : nullptr; // JigSaw v2
             ggml_tensor * moe_out = build_moe_ffn(cur,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_up_exps,
@@ -324,6 +325,7 @@ llama_model_step35::graph::graph(const llama_model & model, const llm_graph_para
                     (llama_expert_gating_func_type) hparams.expert_gating_func,
                     il);
             cb(moe_out, "ffn_moe_out", il);
+            teaming_layer = nullptr;
 
             // shared expert MLP (always added on MoE layers in Step35)
             ggml_tensor * sh_out = build_ffn(cur,

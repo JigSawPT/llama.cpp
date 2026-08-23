@@ -1941,7 +1941,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
+                // JigSaw (23/08): id<0 = posicao saltada; nunca faz match e resolve-se abaixo
+                assert(expert_to_use < ne02);
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
@@ -1951,7 +1952,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    // JigSaw (23/08): posicoes com id<0 nao foram emparelhadas. O ids_from delas ja e 0
+    // (vector value-initialized) -> apanham a linha 0 do dst_sorted, finita, que a mascara
+    // multiplica por 0. O pad do ids_to preserva o layout [to | from] em 2*ne_get_rows;
+    // as linhas de pad nunca sao consumidas pelas GEMMs (tokens_per_expert nao as conta).
+    if (ids_to_sorted_host.empty()) {
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        return;
+    }
+    GGML_ASSERT(ids_to_sorted_host.size() <= size_t(ne_get_rows));
+    ids_to_sorted_host.resize(ne_get_rows, 0);
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 

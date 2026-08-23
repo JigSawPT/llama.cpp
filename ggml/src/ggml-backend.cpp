@@ -1665,7 +1665,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-                                GGML_ASSERT(id >= 0 && id < n_expert);
+                                if (id < 0) { continue; } // JigSaw: posicao saltada
+                                GGML_ASSERT(id < n_expert);
                                 ggml_bitset_set(used_ids.data(), id);
                             }
                         }
@@ -1688,6 +1689,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             expert_size_copy + padding_end);
                     };
 
+                    // P0-B (23/08): com todos os ids saltados (-1) o bitset esta vazio e o
+                    // walk original leria alem do fim. Conjunto vazio = nada a copiar.
+                    bool jig_algum = false;
+                    for (int64_t jb = 0; jb < (int64_t) used_ids.size(); jb++) {
+                        if (used_ids[jb]) { jig_algum = true; break; }
+                    }
+                    if (!jig_algum) { continue; }
                     int id = 0;
                     while (!ggml_bitset_get(used_ids.data(), id)) {
                         id++;

@@ -1336,6 +1336,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             exp_probs_b = nullptr;
         }
 
+        teaming_layer = layer.teaming_up_hot ? &layer : nullptr; // JigSaw Teaming v2
         ggml_tensor * moe_out = build_moe_ffn(cur,
                 layer.ffn_gate_inp,
                 layer.ffn_up_exps,
@@ -1354,6 +1355,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 nullptr,
                 selected_experts);
         cb(moe_out, "ffn_moe_out", il);
+        teaming_layer = nullptr;
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
                 layer.ffn_up_shexp, nullptr, nullptr,
