@@ -2137,7 +2137,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // copias e ~6% (o lote toca quase todos os experts) e os caminhos MMQ/upload assumem
     // ids unicos por token - garantia do top-k que a substituicao por dummy quebra
     // (quantize_scatter: illegal access). Prefill fica no caminho normal, intocado.
-    if (n_tokens == 1 &&
+    // P1-F do review: com LoRA carregado, a cadeia fria aplicava-o e a quente (copias
+    // sem adapter) nao -> logits errados. Teaming desliga-se na presenca de loras.
+    const bool jt_sem_lora = loras == nullptr || loras->empty();
+    if (n_tokens == 1 && jt_sem_lora &&
         jt && jt->teaming_up_hot && jt->teaming_down_hot && jt->teaming_dummy_cold >= 0 &&
         !gate_up_exps && !weight_before_ffn) {
         // get_rows com indices 2D exige tabela por-token (a->ne[2]==b->ne[1]); a nossa

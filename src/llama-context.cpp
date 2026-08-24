@@ -1669,16 +1669,20 @@ static void llama_jigsaw_adapta(const llama_model & model_c) {
             if (!ja) { entram.push_back(e); }
         }
         int trocas = 0;
+        // histerese (24/08, fumo 21: 94 trocas num refresh = churn de empates no corte,
+        // ~1s de stall): o candidato so despeja o incumbente se tiver 1,5x as rotas dele.
         auto copia_slot = [&](ggml_tensor * dst, ggml_tensor * src, int e, int slot) {
             const size_t nbe = src->nb[2];
             if (palco.size() < nbe) { palco.resize(nbe); }
             ggml_backend_tensor_get(src, palco.data(), (size_t) e * nbe, nbe);
             ggml_backend_tensor_set(dst, palco.data(), (size_t) slot * dst->nb[2], nbe);
         };
-        for (int slot = 0; slot < hot_n && !entram.empty() && trocas < 4; slot++) {
+        for (int slot = 0; slot < hot_n && !entram.empty() && trocas < 4 && trocas_tot + trocas < 24; slot++) {
             const int e_actual = l.teaming_hot_ids[slot];
             if (quer[e_actual]) { continue; } // fica
-            const int e_novo = entram.back(); entram.pop_back();
+            const int e_novo = entram.back();
+            if (r[e_novo] < r[e_actual] + r[e_actual]/2) { continue; } // histerese 1,5x
+            entram.pop_back();
             copia_slot(l.teaming_up_hot,   l.ffn_up_exps,   e_novo, slot);
             if (l.teaming_gate_hot) { copia_slot(l.teaming_gate_hot, l.ffn_gate_exps, e_novo, slot); }
             copia_slot(l.teaming_down_hot, l.ffn_down_exps, e_novo, slot);
@@ -1709,7 +1713,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (std::getenv("LLAMA_TEAMING_ADAPT")) {
         static int64_t jt_tokens = 0;
         jt_tokens += batch_inp.n_tokens;
-        if (jt_tokens >= 256) {
+        if (jt_tokens >= 512) { // intervalo dobrado (menos churn, custo amortizado)
             jt_tokens = 0;
             llama_jigsaw_adapta(model);
         }

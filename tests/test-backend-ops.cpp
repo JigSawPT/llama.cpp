@@ -4494,6 +4494,85 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// JigSaw (24/08): o CONTRATO do teaming - a combinacao mascarada de duas cadeias
+// (quente com ids remapeados p/ copias, fria com ids -1 nas posicoes quentes) tem de
+// ser IGUAL ao mul_mat_id plano. out = (oh*m + oc*(1-m)) - plano ~= 0 em qualquer
+// backend. Cobre: -1 (saltados), duplicados (dummy quente), all-hot, all-cold.
+struct test_jigsaw_masked_id : public test_case {
+    const ggml_type type_a;
+    const int n_mats;   // experts no tensor plano
+    const int n_hot;    // experts copiados
+    const int n_used;
+    const int64_t m, n, k;
+    const float frac_hot; // fraccao de posicoes quentes (0, .25, .5, 1)
+    const uint32_t seed;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_a, n_mats, n_hot, n_used, m, n, k, frac_hot, seed);
+    }
+    double max_nmse_err() override { return 5e-4; }
+
+    test_jigsaw_masked_id(ggml_type type_a, int n_mats, int n_hot, int n_used,
+                          int64_t m, int64_t n, int64_t k, float frac_hot, uint32_t seed)
+        : type_a(type_a), n_mats(n_mats), n_hot(n_hot), n_used(n_used),
+          m(m), n(n), k(k), frac_hot(frac_hot), seed(seed) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_used, n);
+        ggml_set_name(b, "b");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "jig_ids");
+        ggml_tensor * ids_hot = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids_hot, "jig_ids_hot");
+        ggml_tensor * ids_cold = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids_cold, "jig_ids_cold");
+        ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+        ggml_set_name(mask, "jig_mask");
+        // copias quentes = view dos primeiros n_hot experts do tensor plano (mesma memoria
+        // = mesmos valores; o remap id->slot e a identidade porque os quentes sao 0..n_hot-1)
+        ggml_tensor * as_hot = ggml_view_3d(ctx, as, k, m, n_hot, as->nb[1], as->nb[2], 0);
+        ggml_set_name(as_hot, "as_hot");
+
+        ggml_tensor * plano = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_tensor * oh    = ggml_mul_mat_id(ctx, as_hot, b, ids_hot);
+        ggml_tensor * oc    = ggml_mul_mat_id(ctx, as, b, ids_cold);
+        ggml_tensor * inv   = ggml_scale_bias(ctx, mask, -1.0f, 1.0f);
+        ggml_tensor * dual  = ggml_add(ctx, ggml_mul(ctx, oh, mask), ggml_mul(ctx, oc, inv));
+        ggml_tensor * out   = ggml_sub(ctx, dual, plano);
+        ggml_set_name(out, "jig_out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(seed);
+        std::vector<int32_t> vids((size_t) n_used * n), vh(vids.size()), vc(vids.size());
+        std::vector<float> vm(vids.size());
+        for (int64_t t = 0; t < n; t++) {
+            for (int64_t u = 0; u < n_used; u++) {
+                const size_t i = (size_t) t * n_used + u;
+                const bool quente = (rng() % 1000) < (uint32_t)(frac_hot * 1000.0f);
+                // id verdadeiro: quente vem de [0, n_hot), frio de [n_hot, n_mats)
+                int32_t id = quente ? (int32_t)(rng() % n_hot)
+                                    : (int32_t)(n_hot + rng() % (n_mats - n_hot));
+                vids[i] = id;
+                vm[i]   = quente ? 1.0f : 0.0f;
+                vh[i]   = quente ? id : 0;      // frio -> dummy quente 0 (duplicados!)
+                vc[i]   = quente ? -1 : id;     // quente -> -1 (saltado)
+            }
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string nome = t->name;
+            if (nome == "jig_ids")       { ggml_backend_tensor_set(t, vids.data(), 0, vids.size()*4); }
+            else if (nome == "jig_ids_hot")  { ggml_backend_tensor_set(t, vh.data(), 0, vh.size()*4); }
+            else if (nome == "jig_ids_cold") { ggml_backend_tensor_set(t, vc.data(), 0, vc.size()*4); }
+            else if (nome == "jig_mask")     { ggml_backend_tensor_set(t, vm.data(), 0, vm.size()*4); }
+            else if (t->type != GGML_TYPE_I32 && !ggml_is_view_op(t->op)) { init_tensor_uniform(t); }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -8898,6 +8977,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 #if 1
+    // JigSaw (24/08): contrato mascarado - reproducer do portao de default
+    for (float fh : {0.0f, 0.25f, 0.5f, 1.0f}) {
+        for (int64_t nn : {1, 2, 13, 14, 16}) {
+            for (uint32_t sd : {7u, 77u, 777u}) {
+                test_cases.emplace_back(new test_jigsaw_masked_id(GGML_TYPE_MXFP4, 32, 8, 6, 256, nn, 512, fh, sd));
+                test_cases.emplace_back(new test_jigsaw_masked_id(GGML_TYPE_IQ3_XXS, 32, 16, 8, 256, nn, 512, fh, sd));
+            }
+        }
+    }
+
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             std::vector<int> ks = { 256 };
