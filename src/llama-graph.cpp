@@ -2037,6 +2037,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_biased", il);
     }
 
+    // JigSaw: vies do router (24/08). Empurra a SELECCAO para os experts com copia
+    // quente em VRAM, somando B*mascara aos selection_probs - o MESMO padrao do
+    // exp_probs_b do V3: muda quais experts entram no top-k, NAO muda os pesos da
+    // mistura (probs). Antes do top-k de grupos, para o vies contar tambem na escolha
+    // do grupo. teaming_is_hot e mantido pelo refresher v2.1, portanto compoe com o
+    // adaptativo. Ligado por LLAMA_TEAMING_ROUTER_BIAS=<float>; 0/ausente = inerte.
+    if (teaming_layer && teaming_layer->teaming_is_hot && selected_experts_in == nullptr) {
+        static const float jt_vies = [] {
+            const char * s = getenv("LLAMA_TEAMING_ROUTER_BIAS");
+            return s ? (float) atof(s) : 0.0f;
+        }();
+        if (jt_vies != 0.0f) {
+            ggml_tensor * jt_m = ggml_reshape_2d(ctx0, teaming_layer->teaming_is_hot, n_expert, 1);
+            selection_probs = ggml_add(ctx0, selection_probs,
+                    ggml_scale(ctx0, jt_m, jt_vies));
+            cb(selection_probs, "ffn_moe_probs_jt_vies", il);
+        }
+    }
+
     // select top n_group_used expert groups
     // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py#L440-L457
     if (hparams.n_expert_groups > 1 && n_tokens > 0) {

@@ -1678,11 +1678,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // frios da DDR5 - as larguras somam DE VERDADE porque o original fica no host e nada
     // atravessa o PCIe no decode. Env: LLAMA_TEAMING_HOT_N + LLAMA_TEAMING_HOT_LIST
     // (formato: "camada id id id ..." por linha). Ver external/TEAMING_V2_DESIGN.md.
+    // MOCHILA POR CAMADA (24/08): LLAMA_TEAMING_HOT_N=0 deixa de significar "desligado" e
+    // passa a significar "usa exactamente os ids que CADA linha listar" - ou seja, o
+    // numero de copias varia por camada. Existe porque as camadas nao sao igualmente
+    // concentradas: dar 8 copias a uma camada quase uniforme desperdica VRAM que rendia
+    // mais numa camada concentrada. O reparto optimo e calculado offline em
+    // bench/scripts/mochila_experts.py (ganho marginal ordenado - optimo exacto quando
+    // todos os experts custam o mesmo). N>0 mantem o comportamento antigo (uniforme).
     if (const char * thn = std::getenv("LLAMA_TEAMING_HOT_N")) {
         const int hot_n = atoi(thn);
+        const bool mochila = (hot_n == 0);
         const char * thl = std::getenv("LLAMA_TEAMING_HOT_LIST");
         ggml_backend_dev_t tgpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-        if (hot_n > 0 && thl && tgpu) {
+        if ((hot_n > 0 || mochila) && thl && tgpu) {
             std::map<int, std::vector<int>> quentes;
             {
                 std::ifstream f(thl);
@@ -1692,7 +1700,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     int lil, id;
                     if (!(iss >> lil)) continue;
                     auto & v = quentes[lil];
-                    while ((int) v.size() < hot_n && (iss >> id)) v.push_back(id);
+                    while ((mochila || (int) v.size() < hot_n) && (iss >> id)) v.push_back(id);
                 }
             }
             int n_moe = 0;
@@ -1709,7 +1717,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     auto & l = layers[il];
                     auto it = quentes.find((int) il);
                     if (!l.ffn_up_exps || !l.ffn_down_exps || it == quentes.end()) continue;
-                    if ((int) it->second.size() < hot_n) continue;
+                    // na mochila cada camada tem o seu N (pode ser 0 = camada sem copias)
+                    const int hot_n_camada = mochila ? (int) it->second.size() : hot_n;
+                    if (hot_n_camada <= 0 || (int) it->second.size() < hot_n_camada) continue;
                     // A1.1 do review (23/08): camadas com experts JA RESIDENTES na GPU nao
                     // levam teaming - copiar VRAM para VRAM e desperdicio, e a cadeia
                     // "fria" com ids -1 correria no MMVQ da GPU, que le -1 como
@@ -1719,7 +1729,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         continue;
                     }
                     auto faz = [&](ggml_tensor * src) {
-                        ggml_tensor * t = ggml_new_tensor_3d(tctx, src->type, src->ne[0], src->ne[1], hot_n);
+                        ggml_tensor * t = ggml_new_tensor_3d(tctx, src->type, src->ne[0], src->ne[1], hot_n_camada);
                         ggml_format_name(t, "%s.jigsaw_hot", src->name);
                         return t;
                     };
@@ -1749,10 +1759,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         auto & l = layers[il];
                         if (!l.teaming_up_hot) continue;
                         auto & ids = quentes[(int) il];
+                        const int n_cam = (int) l.teaming_up_hot->ne[2]; // N desta camada
                         auto copia = [&](ggml_tensor * dst, ggml_tensor * src) {
                             const size_t nbe = src->nb[2]; // bytes por expert
                             if (palco.size() < nbe) palco.resize(nbe);
-                            for (int s = 0; s < hot_n; s++) {
+                            for (int s = 0; s < n_cam; s++) {
                                 ggml_backend_tensor_get(src, palco.data(), (size_t) ids[s]*nbe, nbe);
                                 ggml_backend_tensor_set(dst, palco.data(), (size_t) s*dst->nb[2], nbe);
                             }
@@ -1762,13 +1773,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                         copia(l.teaming_down_hot, l.ffn_down_exps);
                         std::fill(vhot.begin(), vhot.end(), 0.0f);
                         std::fill(vmap.begin(), vmap.end(), 0);
-                        for (int s = 0; s < hot_n; s++) {
+                        for (int s = 0; s < n_cam; s++) {
                             vhot[ids[s]] = 1.0f;
                             vmap[ids[s]] = s;
                         }
                         ggml_backend_tensor_set(l.teaming_is_hot, vhot.data(), 0, n_exp*sizeof(float));
                         ggml_backend_tensor_set(l.teaming_remap,  vmap.data(), 0, n_exp*sizeof(int32_t));
-                        l.teaming_hot_ids.assign(ids.begin(), ids.begin() + hot_n);
+                        l.teaming_hot_ids.assign(ids.begin(), ids.begin() + (int) l.teaming_up_hot->ne[2]);
                         l.teaming_dummy_cold = -1;
                         for (uint32_t e = 0; e < n_exp; e++) {
                             if (vhot[e] == 0.0f) { l.teaming_dummy_cold = (int32_t) e; break; }
