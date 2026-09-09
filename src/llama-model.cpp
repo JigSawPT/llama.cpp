@@ -1705,6 +1705,38 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             int n_moe = 0;
             for (auto & l : layers) if (l.ffn_up_exps && l.ffn_down_exps) n_moe++;
+            // v3: trava de orcamento. As copias tem de deixar LLAMA_TEAMING_VRAM_RESERVE_MIB livres
+            // (omissao 1024 = o penhasco medido + nada; o KV e os buffers de compute ainda nao estao
+            // alocados aqui e contam contra a reserva, por isso o valor deve incluir o KV do -c usado).
+            // Acima do orcamento, cada lista e encurtada na mesma proporcao (as listas vem ordenadas
+            // por ganho marginal, logo cai o que rende menos).
+            bool reduzido = false;
+            if (!quentes.empty()) {
+                size_t vfree = 0, vtotal = 0;
+                ggml_backend_dev_memory(tgpu, &vfree, &vtotal);
+                const char * rs = std::getenv("LLAMA_TEAMING_VRAM_RESERVE_MIB");
+                const double reserva = (rs ? atof(rs) : 1024.0) * 1024.0 * 1024.0;
+                double pedido = 0.0;
+                for (auto & kv : quentes) {
+                    if (kv.first < 0 || kv.first >= (int) layers.size()) continue;
+                    auto & l = layers[kv.first];
+                    if (!l.ffn_up_exps || !l.ffn_down_exps) continue;
+                    const double por_expert = (double) l.ffn_up_exps->nb[2] + (l.ffn_gate_exps ? (double) l.ffn_gate_exps->nb[2] : 0.0) + (double) l.ffn_down_exps->nb[2];
+                    pedido += por_expert * (double) (mochila ? kv.second.size() : std::min<size_t>(kv.second.size(), (size_t) hot_n));
+                }
+                const double orcamento = (double) vfree - reserva;
+                if (orcamento <= 0.0) {
+                    LLAMA_LOG_WARN("%s: JigSaw v3: VRAM livre %.0f MiB nao chega para a reserva de %.0f MiB - copias desligadas\n",
+                            __func__, vfree / 1048576.0, reserva / 1048576.0);
+                    quentes.clear();
+                } else if (pedido > orcamento) {
+                    const double f = orcamento / pedido;
+                    for (auto & kv : quentes) kv.second.resize((size_t) ((double) kv.second.size() * f));
+                    reduzido = true;
+                    LLAMA_LOG_WARN("%s: JigSaw v3: copias pedidas %.0f MiB > orcamento %.0f MiB (livre %.0f - reserva %.0f): listas a %.0f%%\n",
+                            __func__, pedido / 1048576.0, orcamento / 1048576.0, vfree / 1048576.0, reserva / 1048576.0, 100.0 * f);
+                }
+            }
             if (n_moe > 0 && !quentes.empty()) {
                 ggml_init_params tip = {
                     /*.mem_size   =*/ ggml_tensor_overhead()*(size_t)(n_moe*5 + 1),
@@ -1718,7 +1750,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     auto it = quentes.find((int) il);
                     if (!l.ffn_up_exps || !l.ffn_down_exps || it == quentes.end()) continue;
                     // na mochila cada camada tem o seu N (pode ser 0 = camada sem copias)
-                    const int hot_n_camada = mochila ? (int) it->second.size() : hot_n;
+                    const int hot_n_camada = (mochila || reduzido) ? (int) it->second.size() : hot_n;
                     if (hot_n_camada <= 0 || (int) it->second.size() < hot_n_camada) continue;
                     // A1.1 do review (23/08): camadas com experts JA RESIDENTES na GPU nao
                     // levam teaming - copiar VRAM para VRAM e desperdicio, e a cadeia

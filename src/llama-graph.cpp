@@ -2141,6 +2141,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    // ----- 03/09: contador de rotas para o mapa de calor em QUALQUER arch e tambem no prefill -----
+    // O contador so corria dentro do ramo teaming (n_tokens==1 e copias carregadas), por isso o
+    // deepseek4 sem hot-list nunca contou (heatmap 03/09 "SEM DUMP"). Aqui conta sempre que
+    // LLAMA_TEAMING_DEBUG esta definido; o map_custom corre na CPU (copia dos ids), so para medir.
+    if (std::getenv("LLAMA_TEAMING_DEBUG") && !(n_tokens == 1 && teaming_layer && teaming_layer->teaming_up_hot)) {
+        ggml_tensor * ids_dbg = ggml_cont(ctx0, selected_experts);
+        ids_dbg = ggml_map_custom1(ctx0, ids_dbg, llama_jigsaw_conta_rotas, 1, (void *)(intptr_t) il);
+        ggml_build_forward_expand(gf, ids_dbg);
+    }
     // ----- JigSaw Teaming v2 (22/08): divisao quentes(VRAM)/frios(CPU) em paralelo -----
     // As copias quentes vivem em VRAM; o tensor original fica no host. Cada GEMM de
     // experts corre DUAS vezes - a quente le so as copias (ids frios apontam a um dummy

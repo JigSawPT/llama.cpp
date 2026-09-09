@@ -1639,9 +1639,18 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 // A cada N tokens de decode, re-ranqueia os contadores de rotas (colhidos no PREFILL,
 // nao-enviesados) e troca ate 4 experts por camada nas copias de VRAM + tabelas.
 // Corre no inicio de decode() - sincrono, nenhum grafo em voo. Env: LLAMA_TEAMING_ADAPT=1.
-static void llama_jigsaw_adapta(const llama_model & model_c) {
+static void llama_jigsaw_adapta(const llama_model & model_c, double t_eff, int max_trocas_camada) {
     llama_model & model = const_cast<llama_model &>(model_c); // fork: mutacao deliberada das copias
     const int n_exp = (int) model.hparams.n_expert;
+    // v3 "auto" (LLAMA_TEAMING_AUTO=1): a troca paga-se se a poupanca esperada na proxima janela
+    // de 512 tokens cobrir o upload com margem. Bandas em GB/s, medidas nesta maquina por omissao.
+    static const bool   jt_auto    = std::getenv("LLAMA_TEAMING_AUTO") != nullptr;
+    static const double jt_bw_h2d  = std::getenv("LLAMA_TEAMING_BW_H2D")  ? atof(std::getenv("LLAMA_TEAMING_BW_H2D"))  : 57.9;
+    static const double jt_bw_host = std::getenv("LLAMA_TEAMING_BW_HOST") ? atof(std::getenv("LLAMA_TEAMING_BW_HOST")) : 69.0;
+    static const double jt_bw_vram = std::getenv("LLAMA_TEAMING_BW_VRAM") ? atof(std::getenv("LLAMA_TEAMING_BW_VRAM")) : 1800.0;
+    static const double jt_margem  = std::getenv("LLAMA_TEAMING_MARGEM")  ? atof(std::getenv("LLAMA_TEAMING_MARGEM"))  : 2.0;
+    const double janela = 512.0 / std::max(t_eff, 512.0); // hits observados -> hits esperados na proxima janela
+    int recusadas = 0;
     static std::vector<int64_t> rotas;
     rotas.assign((size_t) 96 * n_exp, 0);
     ggml_jigsaw_rotas_snapshot(rotas.data(), 96, n_exp);
@@ -1677,11 +1686,19 @@ static void llama_jigsaw_adapta(const llama_model & model_c) {
             ggml_backend_tensor_get(src, palco.data(), (size_t) e * nbe, nbe);
             ggml_backend_tensor_set(dst, palco.data(), (size_t) slot * dst->nb[2], nbe);
         };
-        for (int slot = 0; slot < hot_n && !entram.empty() && trocas < 4 && trocas_tot + trocas < 24; slot++) {
+        const double bytes_e = (double) l.ffn_up_exps->nb[2] + (l.ffn_gate_exps ? (double) l.ffn_gate_exps->nb[2] : 0.0) + (double) l.ffn_down_exps->nb[2];
+        const double custo_us = bytes_e / (jt_bw_h2d * 1e3);
+        const double ganho_us = bytes_e * (1.0 / (jt_bw_host * 1e3) - 1.0 / (jt_bw_vram * 1e3)); // por token em que o expert e escolhido
+        for (int slot = 0; slot < hot_n && !entram.empty() && trocas < max_trocas_camada && trocas_tot + trocas < 6 * max_trocas_camada; slot++) {
             const int e_actual = l.teaming_hot_ids[slot];
             if (quer[e_actual]) { continue; } // fica
             const int e_novo = entram.back();
-            if (r[e_novo] < r[e_actual] + r[e_actual]/2) { continue; } // histerese 1,5x
+            if (jt_auto) {
+                const double hits_extra = (double) (r[e_novo] - r[e_actual]) * janela;
+                if (hits_extra * ganho_us < jt_margem * custo_us) { recusadas++; continue; }
+            } else if (r[e_novo] < r[e_actual] + r[e_actual]/2) {
+                continue; // v2.1: histerese 1,5x
+            }
             entram.pop_back();
             copia_slot(l.teaming_up_hot,   l.ffn_up_exps,   e_novo, slot);
             if (l.teaming_gate_hot) { copia_slot(l.teaming_gate_hot, l.ffn_gate_exps, e_novo, slot); }
@@ -1704,18 +1721,42 @@ static void llama_jigsaw_adapta(const llama_model & model_c) {
         }
     }
     ggml_jigsaw_rotas_meia_vida(); // decaimento: o passado pesa metade a cada refresh
-    if (trocas_tot > 0) {
-        LLAMA_LOG_WARN("JigSaw v2.1: refresh adaptativo trocou %d experts quentes\n", trocas_tot);
+    if (trocas_tot > 0 || recusadas > 0) {
+        LLAMA_LOG_WARN("JigSaw %s: refresh trocou %d experts quentes, recusou %d (janela %.0f tokens, max %d/camada)\n",
+                jt_auto ? "v3" : "v2.1", trocas_tot, recusadas, t_eff, max_trocas_camada);
     }
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    if (std::getenv("LLAMA_TEAMING_ADAPT")) {
-        static int64_t jt_tokens = 0;
+    static const bool jt_auto_on = std::getenv("LLAMA_TEAMING_AUTO") != nullptr;
+    if (jt_auto_on || std::getenv("LLAMA_TEAMING_ADAPT")) {
+        static int64_t jt_tokens     = 0;   // tokens desde o ultimo refresh
+        static double  jt_t_eff      = 0.0; // janela de observacao com meia-vida (tokens)
+        static int     jt_max_trocas = 4;
+        static int64_t jt_last_us    = 0;
+        static int32_t jt_last_n     = 0;
+        static double  jt_ema        = 0.0; // us por token (intervalo entre chamadas de 1 token)
+        static double  jt_ema_antes  = 0.0;
+        static int     jt_depois     = 0;   // tokens que faltam para julgar o ultimo refresh
+        const int64_t now = ggml_time_us();
+        if (batch_inp.n_tokens == 1 && jt_last_n == 1 && jt_last_us > 0) {
+            const double dt = (double) (now - jt_last_us);
+            jt_ema = jt_ema > 0.0 ? 0.9 * jt_ema + 0.1 * dt : dt;
+            if (jt_depois > 0 && --jt_depois == 0 && jt_ema_antes > 0.0 && jt_auto_on) {
+                // malha fechada: um refresh que abrandou o decode corta o orcamento de trocas; um bom repoe-o
+                jt_max_trocas = (jt_ema > 1.05 * jt_ema_antes) ? std::max(1, jt_max_trocas / 2) : std::min(4, jt_max_trocas + 1);
+                LLAMA_LOG_WARN("JigSaw v3: %.0f -> %.0f us/token apos o refresh; trocas/camada = %d\n", jt_ema_antes, jt_ema, jt_max_trocas);
+            }
+        }
+        jt_last_us = now;
+        jt_last_n  = batch_inp.n_tokens;
         jt_tokens += batch_inp.n_tokens;
         if (jt_tokens >= 512) { // intervalo dobrado (menos churn, custo amortizado)
+            jt_t_eff = 0.5 * jt_t_eff + (double) jt_tokens; // mesma meia-vida dos contadores
             jt_tokens = 0;
-            llama_jigsaw_adapta(model);
+            jt_ema_antes = jt_ema;
+            jt_depois = 128;
+            llama_jigsaw_adapta(model, jt_t_eff, jt_auto_on ? jt_max_trocas : 4);
         }
     }
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
