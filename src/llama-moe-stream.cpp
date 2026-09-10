@@ -796,7 +796,58 @@ size_t llama_moe_stream::size_bufs() const {
 // difference between two consecutive blocks, which the reader can form and the writer cannot.
 // A restarted server starts the counts at zero because the manager is new, not because anything
 // was cleared.
+// JigSaw: dump the per-layer expert ranking in the format LLAMA_MOE_STREAM_PIN_LIST reads,
+// so one profiling run produces the list the next run pins. One line per layer:
+//   <il> <expert id by descending access count> ...
+// Experts never touched are left out: pinning a cold expert costs a slot and buys nothing.
+static void llama_moe_stream_write_profile(const char * path,
+        const std::vector<std::unique_ptr<llama_moe_stream_layer>> & layers) {
+    std::ofstream f(path);
+    if (!f) {
+        LLAMA_LOG_WARN("moe stream: cannot write profile to %s\n", path);
+        return;
+    }
+
+    uint64_t n_lines = 0;
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const auto & sl = layers[il];
+        if (!sl || sl->route_total.empty()) {
+            continue;
+        }
+
+        std::vector<int32_t> ord;
+        ord.reserve(sl->route_total.size());
+        for (size_t e = 0; e < sl->route_total.size(); ++e) {
+            if (sl->route_total[e] > 0) {
+                ord.push_back((int32_t) e);
+            }
+        }
+        if (ord.empty()) {
+            continue;
+        }
+
+        // stable on ties so two runs of the same trace give the same file
+        std::stable_sort(ord.begin(), ord.end(), [&](int32_t a, int32_t b) {
+            return sl->route_total[a] > sl->route_total[b];
+        });
+
+        f << il;
+        for (const int32_t e : ord) {
+            f << ' ' << e;
+        }
+        f << '\n';
+        n_lines++;
+    }
+
+    LLAMA_LOG_WARN("moe stream: JigSaw profile written to %s (%llu layers)\n",
+            path, (unsigned long long) n_lines);
+}
+
 void llama_moe_stream::print_stats(const char * role) const {
+    if (const char * out = std::getenv("LLAMA_MOE_STREAM_PROFILE_OUT")) {
+        llama_moe_stream_write_profile(out, layers);
+    }
+
     std::lock_guard<std::mutex> lock(mtx);
 
     // "target: " / "drafter: ", or nothing at all. Built once and passed down so that every line
