@@ -478,7 +478,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         ggml_tensor * hc_base,
         ggml_tensor ** post,
         ggml_tensor ** comb,
-        int il) const {
+        int il,
+        ggml_tensor ** carry) const {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t hc_dim     = hc*n_embd;
     const int64_t hc_mix_dim = (2 + hc)*hc;
@@ -525,7 +526,18 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     }
     cb(*comb, "hc_comb", il);
 
-    ggml_tensor * result = build_hc_pre(x, pre, il);
+    if (carry == nullptr) {
+        return build_hc_pre(x, pre, il);
+    }
+
+    // the mix computed here feeds the NEXT sublayer; collapse with the previous one's.
+    // The first attention has no predecessor and the reference starts from a one-hot on
+    // stream 0 (make_identity_pre_mix), which is just that stream.
+    ggml_tensor * result = *carry
+        ? build_hc_pre(x, *carry, il)
+        : ggml_cont(ctx0, ggml_view_2d(ctx0, x, n_embd, nt, x->nb[2], 0));
+
+    *carry = pre;
     return result;
 }
 
@@ -1423,6 +1435,11 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         res->add_input(std::move(inp));
     }
 
+    // V4.1 threads the hyper-connection mix one sublayer ahead; V4 collapses in place and
+    // passes nullptr, which leaves its graph unchanged.
+    ggml_tensor *  hc_carry_v = nullptr;
+    ggml_tensor ** hc_carry   = arch == LLM_ARCH_DEEPSEEK41 ? &hc_carry_v : nullptr;
+
     const int64_t hc = hparams.dsv4_hc_mult;
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
@@ -1454,7 +1471,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 model.layers[il].hc_attn_fn,
                 model.layers[il].hc_attn_scale,
                 model.layers[il].hc_attn_base,
-                &post, &comb, il);
+                &post, &comb, il, hc_carry);
         cb(cur, "hc_attn_pre", il);
 
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -1470,7 +1487,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 model.layers[il].hc_ffn_fn,
                 model.layers[il].hc_ffn_scale,
                 model.layers[il].hc_ffn_base,
-                &post, &comb, il);
+                &post, &comb, il, hc_carry);
         cb(cur, "hc_ffn_pre", il);
 
         ggml_build_forward_expand(gf, residual);
@@ -1541,12 +1558,20 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         inpL = ggml_reshape_3d(ctx0, flat_out, n_embd, hc, n_outputs);
     }
 
-    // no dedicated head weights: fall back to the last layer's ffn mix, as the reference does
-    cur = model.hc_head_fn
-        ? build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base)
-        : build_hc_head(inpL, model.layers[n_layer - 1].hc_ffn_fn,
-                              model.layers[n_layer - 1].hc_ffn_scale,
-                              model.layers[n_layer - 1].hc_ffn_base);
+    // V4.1 has no dedicated head weights: the reference collapses with the mix the last
+    // ffn produced (Transformer.forward: h = layer.hc_pre(h, pre_mix)), not with one
+    // recomputed from the final stream, and build_hc_head would also broadcast the 3-entry
+    // hc_ffn_scale over the 24 mix rows.
+    if (hc_carry != nullptr) {
+        ggml_tensor * pre = hc_carry_v;
+        GGML_ASSERT(pre && "DEEPSEEK41 hc: no mix carried to the final collapse");
+        if (pre->ne[1] != inpL->ne[2]) {
+            pre = ggml_get_rows(ctx0, pre, inp_out_ids);
+        }
+        cur = build_hc_pre(inpL, pre, -1);
+    } else {
+        cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    }
     cb(cur, "hc_head", -1);
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
@@ -1569,6 +1594,11 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
             "nextn_layer_offset out of range [0, n_layer_nextn)");
     GGML_ASSERT(ubatch.token && "DEEPSEEK4 MTP requires token input");
+
+    // V4.1 threads the hyper-connection mix one sublayer ahead; V4 collapses in place and
+    // passes nullptr, which leaves its graph unchanged.
+    ggml_tensor *  hc_carry_v = nullptr;
+    ggml_tensor ** hc_carry   = arch == LLM_ARCH_DEEPSEEK41 ? &hc_carry_v : nullptr;
 
     const int64_t hc = hparams.dsv4_hc_mult;
     GGML_ASSERT(hparams.n_embd_out() == (uint32_t) (n_embd*hc) && "DEEPSEEK4 MTP hidden width mismatch");
@@ -1627,7 +1657,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             layer.hc_attn_fn,
             layer.hc_attn_scale,
             layer.hc_attn_base,
-            &post, &comb, il);
+            &post, &comb, il, hc_carry);
     cb(cur, "mtp_hc_attn_pre", il);
 
     cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -1643,7 +1673,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
             layer.hc_ffn_fn,
             layer.hc_ffn_scale,
             layer.hc_ffn_base,
-            &post, &comb, il);
+            &post, &comb, il, hc_carry);
     cb(cur, "mtp_hc_ffn_pre", il);
 
     cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
@@ -1684,12 +1714,20 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     inpL = ggml_reshape_3d(ctx0, h_nextn, n_embd, hc, n_outputs);
 
-    // no dedicated head weights: fall back to the last layer's ffn mix, as the reference does
-    cur = model.hc_head_fn
-        ? build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base)
-        : build_hc_head(inpL, model.layers[n_layer - 1].hc_ffn_fn,
-                              model.layers[n_layer - 1].hc_ffn_scale,
-                              model.layers[n_layer - 1].hc_ffn_base);
+    // V4.1 has no dedicated head weights: the reference collapses with the mix the last
+    // ffn produced (Transformer.forward: h = layer.hc_pre(h, pre_mix)), not with one
+    // recomputed from the final stream, and build_hc_head would also broadcast the 3-entry
+    // hc_ffn_scale over the 24 mix rows.
+    if (hc_carry != nullptr) {
+        ggml_tensor * pre = hc_carry_v;
+        GGML_ASSERT(pre && "DEEPSEEK41 hc: no mix carried to the final collapse");
+        if (pre->ne[1] != inpL->ne[2]) {
+            pre = ggml_get_rows(ctx0, pre, inp_out_ids);
+        }
+        cur = build_hc_pre(inpL, pre, -1);
+    } else {
+        cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    }
     cb(cur, "mtp_hc_head", -1);
 
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;

@@ -1118,6 +1118,9 @@ struct llama_model_deepseek4 : public llama_model_base {
         graph(const llm_graph_params & params) : llm_graph_context(params) {}
         graph(const llama_model & model, const llm_graph_params & params);
 
+        // carry threads the mix one sublayer ahead (V4.1): on entry it holds the mix the
+        // previous sublayer produced and on exit this sublayer's. nullptr keeps the V4
+        // behaviour of collapsing with the mix just computed from the same stream.
         ggml_tensor * build_hc_pre(
                 ggml_tensor * x,
                 ggml_tensor * hc_fn,
@@ -1125,7 +1128,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * hc_base,
                 ggml_tensor ** post,
                 ggml_tensor ** comb,
-                int il) const;
+                int il,
+                ggml_tensor ** carry = nullptr) const;
 
         ggml_tensor * build_hc_post(
                 ggml_tensor * x,

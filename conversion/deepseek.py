@@ -659,15 +659,27 @@ class DeepseekV4Model(TextModel):
         if self.mtp_only and (num_nextn_predict_layers := hparams.get("num_nextn_predict_layers", 0)) > 0:
             self.gguf_writer.add_nextn_predict_layers(num_nextn_predict_layers)
 
+    def _fp8_block_size(self) -> int:
+        """V4 blocks are 128x128 and V4.1 are 32x32. The wrong size does not raise: the
+        [:out_features] slice keeps the shapes valid and the weights come out mis-scaled."""
+        block = self.hparams.get("quantization_config", {}).get("weight_block_size")
+        if not block:
+            return 128
+        if len(set(block)) != 1:
+            raise ValueError(f"non-square fp8 weight_block_size {block}")
+        return int(block[0])
+
     def dequant_model(self):
         fp8_dtypes = self._float8_dtypes()
         tensors_to_remove: list[str] = []
 
+        block = self._fp8_block_size()
+
         def dequant_fp8_weight(weight: Tensor, scale: Tensor) -> Tensor:
             out_features, in_features = weight.shape
             scale_f = self._e8m0_to_float(scale)
-            scale_f = scale_f.repeat_interleave(128, 0)[:out_features]
-            scale_f = scale_f.repeat_interleave(128, 1)[:, :in_features]
+            scale_f = scale_f.repeat_interleave(block, 0)[:out_features]
+            scale_f = scale_f.repeat_interleave(block, 1)[:, :in_features]
             return weight.float() * scale_f
 
         for name in list(self.model_tensors.keys()):
