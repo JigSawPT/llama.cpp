@@ -46,6 +46,21 @@ class DeepseekV41Model(DeepseekV4Model):
             self.hparams = {**self.hparams, **self.hparams["text_config"]}
         return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
 
+    _ENGRAM_RAW = ".engram.embed."
+
+    def keeps_raw_dtype(self, name: str) -> bool:
+        # the engram table travels as raw fp8 bytes; f32 would be 393 GiB per layer
+        return self._ENGRAM_RAW in name
+
+    def dequant_model(self):
+        # the inherited pass pairs every .scale with its fp8 .weight and consumes both. For the
+        # engram table that would delete the scale the C++ requires and dequantize 384M rows.
+        held = {k: v for k, v in self.model_tensors.items() if self._ENGRAM_RAW in k}
+        for k in held:
+            del self.model_tensors[k]
+        super().dequant_model()
+        self.model_tensors.update(held)
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         h = self.hparams
@@ -115,10 +130,11 @@ class DeepseekV41Model(DeepseekV4Model):
             if int(flat[e].sum()) != int(rows):
                 raise ValueError(f"engram layer {e}: primes sum to {flat[e].sum()}, table has {rows}")
 
-        self.gguf_writer.add_tensor("engram_token_map",   np.array(token_map, dtype=np.int32))
-        self.gguf_writer.add_tensor("engram_primes",      flat)
-        self.gguf_writer.add_tensor("engram_offsets",     build_offsets(primes))
-        self.gguf_writer.add_tensor("engram_multipliers",
+        # the loader asks for these with a .weight suffix, like every other tensor
+        self.gguf_writer.add_tensor("engram_token_map.weight",   np.array(token_map, dtype=np.int32))
+        self.gguf_writer.add_tensor("engram_primes.weight",      flat)
+        self.gguf_writer.add_tensor("engram_offsets.weight",     build_offsets(primes))
+        self.gguf_writer.add_tensor("engram_multipliers.weight",
                                     build_multipliers(self._engram_layer_ids,
                                                       h["engram_max_ngram_size"], n_compressed))
         logger.info("engram: hash tables written, compressed vocab %d, primes sum matches both tables",
@@ -162,7 +178,10 @@ class DeepseekV41Model(DeepseekV4Model):
             out = self._format_dsv4_tensor_name(key, bid, tail)
             if "embed" in name:
                 # the table stays as raw bytes: 24 rows per token are gathered and dequantized
-                # on the host, and dequantizing 384M rows would need 196 GiB per layer
+                # on the host, and dequantizing 384M rows would need 393 GiB per layer.
+                # keeps_raw_dtype kept the storage intact, so the view is over fp8, not floats.
+                if data_torch.element_size() != 1:
+                    raise ValueError(f"{name}: expected raw fp8 bytes, got {data_torch.dtype}")
                 return [(out, data_torch.view(torch.uint8))]
             return [(out, data_torch)]
         return super().modify_tensors(data_torch, name, bid)

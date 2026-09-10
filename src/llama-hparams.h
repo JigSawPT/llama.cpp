@@ -253,6 +253,11 @@ struct llama_hparams {
     // V4 has neither key and falls back to the compression ratio.
     // which layer's compressed caches this one reads. V4.1 shares them from the nearest
     // preceding kv source; V4 gives every layer its own, so there this is the identity.
+    // first level of the V4.1 indexer: it is the identity while every block fits in the
+    // top-k, which bounds the context this port can serve exactly
+    uint32_t dsv4_candidate_block_size  = 0;
+    uint32_t dsv4_candidate_topk_blocks = 0;
+
     std::array<int32_t, LLAMA_MAX_LAYERS> dsv4_kv_src_layer = {};
 
     std::array<bool, LLAMA_MAX_LAYERS> dsv4_is_kv_source    = {};

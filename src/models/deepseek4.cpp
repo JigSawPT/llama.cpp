@@ -29,10 +29,12 @@ static ggml_tensor * dsv4_engram(
     ggml_tensor * kv = ggml_mul_mat(ctx0, layer.engram_wkv, lookup);
 
     ggml_tensor * key   = ggml_view_3d(ctx0, kv, n_embd, hc, n_tokens, n_embd*esz, kv->nb[1], 0);
-    ggml_tensor * value = ggml_view_2d(ctx0, kv, n_embd, n_tokens, kv->nb[1], hc*n_embd*esz);
 
-    // q and k only ever appear as a product
-    ggml_tensor * w = ggml_mul(ctx0, layer.engram_q, layer.engram_k);
+    // q and k only ever appear as a product. They are bf16 in the checkpoint and no backend
+    // multiplies an f32 activation by a bf16 operand, so cast first: 4x5120 each, free.
+    ggml_tensor * engram_q_f32 = ggml_cast(ctx0, layer.engram_q, GGML_TYPE_F32);
+    ggml_tensor * engram_k_f32 = ggml_cast(ctx0, layer.engram_k, GGML_TYPE_F32);
+    ggml_tensor * w = ggml_mul(ctx0, engram_q_f32, engram_k_f32);
 
     ggml_tensor * dot = ggml_mul(ctx0, ggml_rms_norm(ctx0, h, eps), ggml_rms_norm(ctx0, key, eps));
     dot = ggml_sum_rows(ctx0, ggml_mul(ctx0, dot, w));
@@ -42,8 +44,11 @@ static ggml_tensor * dsv4_engram(
     ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, dot), 1e-6f, INFINITY));
     ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, dot), mag));
 
-    ggml_tensor * v = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, value, n_embd, 1, n_tokens),
-                                     n_embd, hc, n_tokens, 1);
+    // value is a strided view of kv, so it cannot be reshaped: build the shape directly.
+    // With n_tokens == 1 the contiguity check is skipped and the reshape passed by accident.
+    ggml_tensor * v3 = ggml_view_3d(ctx0, kv, n_embd, 1, n_tokens,
+                                    kv->nb[1], kv->nb[1], hc*n_embd*esz);
+    ggml_tensor * v = ggml_repeat_4d(ctx0, v3, n_embd, hc, n_tokens, 1);
 
     return ggml_add(ctx0, h, ggml_mul(ctx0, v, gate));
 }
@@ -151,6 +156,9 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
             hparams.dsv4_kv_src_layer[il] = src;
         }
     }
+
+    ml.get_key(LLM_KV_CANDIDATE_BLOCK_SIZE,  hparams.dsv4_candidate_block_size,  false);
+    ml.get_key(LLM_KV_CANDIDATE_TOPK_BLOCKS, hparams.dsv4_candidate_topk_blocks, false);
 
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func);
     if (hparams.expert_gating_func != LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {

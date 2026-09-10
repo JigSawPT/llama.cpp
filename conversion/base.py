@@ -304,6 +304,12 @@ class ModelBase:
             logger.info(f"  + {scale_name} (per-expert scale, shape [{len(scales)}])")
             self.gguf_writer.add_tensor(scale_name, scale_vals)
 
+    def keeps_raw_dtype(self, name: str) -> bool:
+        """Tensors that must reach modify_tensors with their storage intact. Upcasting a table
+        that is only ever read a few rows at a time would materialize the whole thing."""
+        del name
+        return False
+
     def dequant_model(self):
         # If all quantized tensors were already handled (e.g. pure NVFP4), skip
         if self._is_nvfp4 and not any(k.endswith((".weight_scale", ".weight_scale_inv")) for k in self.model_tensors):
@@ -870,7 +876,7 @@ class ModelBase:
             old_dtype = data_torch.dtype
 
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
+            if data_torch.dtype not in (torch.float16, torch.float32) and not self.keeps_raw_dtype(name):
                 data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
