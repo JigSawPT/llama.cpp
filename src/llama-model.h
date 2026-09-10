@@ -486,6 +486,14 @@ struct llama_layer {
     struct ggml_tensor * indexer_comp_ape   = nullptr;
     struct ggml_tensor * indexer_comp_norm  = nullptr;
 
+    // DeepSeek-V4.1 engram. embd and embd_scale stay on the CPU: they are gathered on the host,
+    // 24 rows per token, and the table is ~91 GiB per layer.
+    struct ggml_tensor * engram_embd       = nullptr;
+    struct ggml_tensor * engram_embd_scale = nullptr;
+    struct ggml_tensor * engram_wkv        = nullptr;
+    struct ggml_tensor * engram_q          = nullptr;
+    struct ggml_tensor * engram_k          = nullptr;
+
     // cogvlm
     struct ggml_tensor * visexp_attn_wqkv = nullptr;
     struct ggml_tensor * visexp_attn_wo   = nullptr;
@@ -572,6 +580,13 @@ struct llama_model {
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
+
+    // DeepSeek-V4.1 engram hash tables, built from the tokenizer at conversion time. Small, and
+    // read on the host: the C++ side only does integer arithmetic with them.
+    struct ggml_tensor * engram_token_map   = nullptr;
+    struct ggml_tensor * engram_primes      = nullptr;
+    struct ggml_tensor * engram_offsets     = nullptr;
+    struct ggml_tensor * engram_multipliers = nullptr;
 
 
     // NVFP4 per-tensor scale2, input_scale for LM head

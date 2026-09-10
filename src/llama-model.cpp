@@ -188,6 +188,7 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_DEEPSEEK32:
             return new llama_model_deepseek32(params);
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
             return new llama_model_deepseek4(params);
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
@@ -1496,6 +1497,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 LLAMA_LOG_WARN("%s: tensor buffer overrides (-ot/--cpu-moe) do not apply to SSD-streamed expert tensors\n", __func__);
             }
             pimpl->moe_stream = std::make_unique<llama_moe_stream>(n_layer_all, n_slots, params.moe_stream_io_threads, params.moe_stream_direct);
+            // JigSaw: o orcamento de pins e clampado AQUI, onde n_expert_used existe. Um pin
+            // rouba um slot ao pool dinamico e o plano de vagas exige 3*n_expert_used slots
+            // dinamicos - sem este clamp o prefill entra em deadlock (medido 22/08, 24s-p8).
+            if (const char * pn = std::getenv("LLAMA_MOE_STREAM_PIN_N")) {
+                const uint32_t n_min  = llama_moe_stream_min_slots(hparams.n_expert_used);
+                const uint32_t maxp   = n_slots > n_min ? n_slots - n_min : 0;
+                const uint32_t pedido = (uint32_t) std::max(0, atoi(pn));
+                pimpl->moe_stream->pin_budget = std::min(pedido, maxp);
+                if (pedido != pimpl->moe_stream->pin_budget) {
+                    LLAMA_LOG_WARN("%s: JigSaw pin_n %u > %u (n_slots %u - 3*n_expert_used %u) - limitado\n",
+                            __func__, pedido, maxp, n_slots, hparams.n_expert_used);
+                }
+            }
             // The option wins over the environment variable, and the variable stays because a
             // measurement series must be able to change one value without touching a command line
             // that is quoted in its own results.
@@ -2369,6 +2383,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 }
             } break;
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
             {
                 GGML_ASSERT(hparams.swa_type != LLAMA_SWA_TYPE_NONE);
 
@@ -2731,7 +2746,7 @@ int32_t llama_model_n_head_kv(const llama_model * model) {
 int32_t llama_model_n_swa(const llama_model * model) {
     // dsv4 kv-cache has SWA but it cannot be used as a rollback because of
     // other compression ratios, so we return 0 here
-    if (model->arch == LLM_ARCH_DEEPSEEK4) {
+    if (model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) {
         return 0;
     }
     return model->hparams.n_swa;
@@ -2816,6 +2831,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DEEPSEEK2OCR:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_PLM:
         case LLM_ARCH_CHATGLM:
         case LLM_ARCH_GRANITE:

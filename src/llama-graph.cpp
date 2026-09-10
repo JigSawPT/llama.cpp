@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-engram.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-moe-stream.h"
@@ -121,6 +122,75 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
 
     return res;
+}
+
+void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+    if (kv.empty() || ubatch == nullptr || ubatch->token == nullptr) {
+        return;
+    }
+
+    auto * cache = mctx->get_kv();
+    GGML_ASSERT(cache != nullptr && cache->engram_enabled());
+
+    llama_engram_tables t;
+    t.token_map   = (const int32_t *) model.engram_token_map->data;
+    t.primes      = (const int64_t *) model.engram_primes->data;
+    t.offsets     = (const int64_t *) model.engram_offsets->data;
+    t.multipliers = (const int64_t *) model.engram_multipliers->data;
+    t.n_layer     = hparams.engram_n_layer;
+    t.n_head      = hparams.engram_n_head;
+    t.max_ngram   = hparams.engram_max_ngram;
+    t.n_hash_cols = hparams.engram_n_hash_cols;
+    t.head_dim    = hparams.engram_head_dim;
+    t.pad_id      = t.token_map[hparams.engram_pad_token];
+
+    const uint32_t n_tokens = ubatch->n_tokens;
+    const size_t   row      = (size_t) t.n_hash_cols*t.head_dim;
+
+    // the whole batch goes into the history first: an n-gram inside the batch looks back at
+    // tokens of this same batch
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        cache->engram_set(ubatch->seq_id[i][0], ubatch->pos[i], t.token_map[ubatch->token[i]]);
+    }
+
+    std::vector<int32_t> hist(t.max_ngram);
+    std::vector<int64_t> rows(t.n_hash_cols);
+    std::vector<float>   buf(row*n_tokens);
+
+    for (uint32_t e = 0; e < t.n_layer; ++e) {
+        const auto & layer = model.layers[hparams.engram_layer_ids[e]];
+
+        GGML_ASSERT(ggml_backend_buffer_is_host(layer.engram_embd->buffer));
+
+        const uint8_t * w  = (const uint8_t *) layer.engram_embd->data;
+        const uint8_t * sc = (const uint8_t *) layer.engram_embd_scale->data;
+
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id s = ubatch->seq_id[i][0];
+            const llama_pos    p = ubatch->pos[i];
+
+            bool blocked = false;
+            for (uint32_t g = 0; g < t.max_ngram; ++g) {
+                const llama_pos q   = p - (llama_pos) g;
+                const int32_t   cid = q < 0 ? llama_kv_cache_dsv4::ENGRAM_DEAD : cache->engram_get(s, q);
+
+                blocked = blocked || cid == llama_kv_cache_dsv4::ENGRAM_DEAD
+                                  || cid == llama_kv_cache_dsv4::ENGRAM_NONE;
+                hist[g] = blocked ? t.pad_id : cid;
+            }
+
+            llama_engram_hash_row(t, e, hist.data(), rows.data());
+
+            float * dst = buf.data() + (size_t) i*row;
+            for (uint32_t c = 0; c < t.n_hash_cols; ++c) {
+                llama_engram_dequant_row(w  + (size_t) rows[c]*t.head_dim,
+                                         sc + (size_t) rows[c]*(t.head_dim/32),
+                                         t.head_dim, dst + (size_t) c*t.head_dim);
+            }
+        }
+
+        ggml_backend_tensor_set(kv[e], buf.data(), 0, row*n_tokens*sizeof(float));
+    }
 }
 
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
@@ -1761,7 +1831,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                         tmp = ggml_clamp(ctx0, tmp, -limit, limit);
                         cb(tmp, "ffn_up_clamped", il);
 
-                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                             cb(cur, "ffn_gate_clamped", il);
                             cur = ggml_swiglu_split(ctx0, cur, tmp);
@@ -2113,8 +2183,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     uint32_t n_stream_waves  = 1;
     uint32_t stream_wave_cap = 0;
     if (msl) {
+        // JigSaw: slots pinados nao sao reclamaveis pela vaga - o plano ve so os dinamicos
         const llama_moe_stream_wave_budget wb = llama_moe_stream_wave_plan(
-                msl->n_slots, (uint32_t) n_expert, (uint32_t) n_expert_used, (uint32_t) n_tokens);
+                msl->n_slots - msl->mgr->pin_budget, (uint32_t) n_expert, (uint32_t) n_expert_used, (uint32_t) n_tokens);
         n_stream_waves  = wb.n_waves;
         stream_wave_cap = wb.cap;
     }
@@ -2203,7 +2274,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         up = ggml_clamp(ctx0, up, -limit, limit);
                         cb(up, "ffn_moe_up_clamped", il);
 
-                        if (arch == LLM_ARCH_DEEPSEEK4 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_clamp(ctx0, cur, -INFINITY, limit);
                             cb(cur, "ffn_moe_gate_clamped", il);
                             cur = ggml_swiglu_split(ctx0, cur, up);

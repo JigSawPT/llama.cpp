@@ -118,6 +118,11 @@ def parse_args() -> argparse.Namespace:
         help="Export multimodal projector (mmproj) for vision models. This will only work on some vision models. An 'mmproj-' prefix will be added to the output file name.",
     )
     parser.add_argument(
+        "--engram", action="store_true",
+        help="DeepSeek-V4.1 only: convert the engram tables (adds ~190 GiB). Without it the model "
+             "loads and runs but does not reproduce the original output.",
+    )
+    parser.add_argument(
         "--mtp", action="store_true",
         help="Export only the multi-token prediction (MTP) head as a separate GGUF, suitable for use as a speculative draft. An 'mtp-' prefix will be added to the output file name.",
     )
@@ -277,6 +282,10 @@ def main() -> None:
                 model_class.no_mtp = True
             if args.mtp:
                 model_class.mtp_only = True
+
+        if getattr(args, "engram", False):
+            from conversion.deepseek_v41 import DeepseekV41Model
+            DeepseekV41Model.convert_engram = True
 
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,

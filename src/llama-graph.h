@@ -608,6 +608,31 @@ public:
     const llama_kv_cache_dsv4_context * mctx;
 };
 
+// DeepSeek-V4.1 conditional memory. The table is ~91 GiB per layer and only n_hash_cols rows
+// are read per token, so the gather and the FP8 dequantization run on the host and the graph
+// gets one plain F32 tensor per engram layer.
+class llm_graph_input_engram : public llm_graph_input_i {
+public:
+    llm_graph_input_engram(
+            const llama_hparams & hparams,
+            const llama_model & model,
+            const llama_kv_cache_dsv4_context * mctx) :
+        hparams(hparams),
+        model(model),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_engram() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    std::vector<ggml_tensor *> kv; // per engram layer: F32 [n_hash_cols*head_dim, n_tokens]
+
+    const llama_hparams & hparams;
+    const llama_model   & model;
+
+    const llama_kv_cache_dsv4_context * mctx;
+};
+
 class llm_graph_input_attn_cross : public llm_graph_input_i {
 public:
     llm_graph_input_attn_cross(const llama_cross * cross) : cross(cross) {}

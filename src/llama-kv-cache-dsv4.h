@@ -143,6 +143,18 @@ public:
     llama_kv_cache_iswa * get_raw() const;
     llama_kv_cache      * get_csa() const;
     llama_kv_cache      * get_hca() const;
+
+    uint32_t get_csa_ratio() const { return csa_ratio; }
+    uint32_t get_hca_ratio() const { return hca_ratio; }
+
+    // Compressed token ids per (sequence, position), for the engram n-gram lookback. Empty when
+    // the model has no engram. ENGRAM_NONE marks a position that was never written.
+    static constexpr int32_t ENGRAM_NONE = -2;
+    static constexpr int32_t ENGRAM_DEAD = -1;
+
+    bool engram_enabled() const { return !engram_hist.empty(); }
+    void engram_set(llama_seq_id seq_id, llama_pos pos, int32_t cid);
+    int32_t engram_get(llama_seq_id seq_id, llama_pos pos) const;
     llama_kv_cache      * get_lid() const;
     llama_dsv4_comp_state * get_csa_state() const;
     llama_dsv4_comp_state * get_hca_state() const;
@@ -161,7 +173,15 @@ private:
     const uint32_t n_seq_max;
     const uint32_t n_rs_seq;
 
+    // compression ratios of the two compressed caches, taken from hparams.dsv4_compress_ratios.
+    // V4 uses 4 and 128; V4.1 uses 2 and 1. Order is first-seen among the non-zero values.
+    const uint32_t csa_ratio;
+    const uint32_t hca_ratio;
+
     std::vector<uint32_t> rs_idx;
+
+    std::vector<int32_t> engram_hist;   // [n_seq_max * engram_hist_size]
+    uint32_t engram_hist_size = 0;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
@@ -267,6 +287,8 @@ private:
 
 class llama_kv_cache_dsv4_context : public llama_memory_context_i {
 public:
+    llama_kv_cache_dsv4 * get_kv() const { return kv; }
+
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
     using stream_copy_info = llama_kv_cache::stream_copy_info;
 
@@ -375,6 +397,11 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
+
+    llama_kv_cache_dsv4 * kv = nullptr;
+
+    const uint32_t csa_ratio = 0;
+    const uint32_t hca_ratio = 0;
 
     std::vector<comp_plan> plans_csa;
     std::vector<comp_plan> plans_hca;

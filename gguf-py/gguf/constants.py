@@ -496,6 +496,7 @@ class MODEL_ARCH(IntEnum):
     DEEPSEEK2OCR     = auto()
     DEEPSEEK32       = auto()
     DEEPSEEK4        = auto()
+    DEEPSEEK41       = auto()
     CHATGLM          = auto()
     GLM4             = auto()
     GLM4_MOE         = auto()
@@ -628,6 +629,15 @@ class MODEL_TENSOR(IntEnum):
     FFN_UP_CHEXP         = auto()
     FFN_EXP_PROBS_B      = auto()
     FFN_GATE_TID2EID     = auto()
+    ENGRAM_EMBED         = auto()
+    ENGRAM_EMBED_SCALE   = auto()
+    ENGRAM_WKV           = auto()
+    ENGRAM_Q             = auto()
+    ENGRAM_K             = auto()
+    ENGRAM_TOKEN_MAP     = auto()
+    ENGRAM_PRIMES        = auto()
+    ENGRAM_OFFSETS       = auto()
+    ENGRAM_MULTIPLIERS   = auto()
     MOE_LATENT_DOWN      = auto() # nemotron 3 super
     MOE_LATENT_UP        = auto() # nemotron 3 super
     ATTN_Q_NORM          = auto()
@@ -1107,6 +1117,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.DEEPSEEK2OCR:     "deepseek2-ocr",
     MODEL_ARCH.DEEPSEEK32:       "deepseek32",
     MODEL_ARCH.DEEPSEEK4:        "deepseek4",
+    MODEL_ARCH.DEEPSEEK41:       "deepseek41",
     MODEL_ARCH.CHATGLM:          "chatglm",
     MODEL_ARCH.GLM4:             "glm4",
     MODEL_ARCH.GLM4_MOE:         "glm4moe",
@@ -1240,6 +1251,15 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_GATE_UP_EXP:           "blk.{bid}.ffn_gate_up_exps",
     MODEL_TENSOR.FFN_EXP_PROBS_B:           "blk.{bid}.exp_probs_b",
     MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
+    MODEL_TENSOR.ENGRAM_EMBED:              "blk.{bid}.engram_embd",
+    MODEL_TENSOR.ENGRAM_EMBED_SCALE:        "blk.{bid}.engram_embd_scale",
+    MODEL_TENSOR.ENGRAM_WKV:                "blk.{bid}.engram_wkv",
+    MODEL_TENSOR.ENGRAM_Q:                  "blk.{bid}.engram_q",
+    MODEL_TENSOR.ENGRAM_K:                  "blk.{bid}.engram_k",
+    MODEL_TENSOR.ENGRAM_TOKEN_MAP:          "engram_token_map",
+    MODEL_TENSOR.ENGRAM_PRIMES:             "engram_primes",
+    MODEL_TENSOR.ENGRAM_OFFSETS:            "engram_offsets",
+    MODEL_TENSOR.ENGRAM_MULTIPLIERS:        "engram_multipliers",
     MODEL_TENSOR.MOE_LATENT_DOWN:           "blk.{bid}.ffn_latent_down",      # nemotron 3 super
     MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",        # nemotron 3 super
     MODEL_TENSOR.LAYER_OUT_NORM:            "blk.{bid}.layer_output_norm",
@@ -4651,6 +4671,22 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
 }
 
 # tensors that will not be serialized
+# DeepSeek-V4.1: os mesmos modulos do V4 mais a memoria condicional (engram). Deriva-se da
+# lista do V4 em vez de a copiar, para nao divergir quando o V4 mudar.
+MODEL_TENSORS[MODEL_ARCH.DEEPSEEK41] = MODEL_TENSORS[MODEL_ARCH.DEEPSEEK4] + [
+    MODEL_TENSOR.INDEXER_ATTN_K,
+    MODEL_TENSOR.INDEXER_K_NORM,
+    MODEL_TENSOR.ENGRAM_EMBED,
+    MODEL_TENSOR.ENGRAM_EMBED_SCALE,
+    MODEL_TENSOR.ENGRAM_WKV,
+    MODEL_TENSOR.ENGRAM_Q,
+    MODEL_TENSOR.ENGRAM_K,
+    MODEL_TENSOR.ENGRAM_TOKEN_MAP,
+    MODEL_TENSOR.ENGRAM_PRIMES,
+    MODEL_TENSOR.ENGRAM_OFFSETS,
+    MODEL_TENSOR.ENGRAM_MULTIPLIERS,
+]
+
 MODEL_TENSOR_SKIP: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     MODEL_ARCH.LLAMA: [
         MODEL_TENSOR.ROPE_FREQS,

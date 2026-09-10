@@ -15,6 +15,39 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
 }
 
+static ggml_tensor * dsv4_engram(
+        ggml_context * ctx0,
+        float eps,
+        const llama_layer & layer,
+        ggml_tensor * lookup,
+        ggml_tensor * h) {
+    const int64_t n_embd   = h->ne[0];
+    const int64_t hc       = h->ne[1];
+    const int64_t n_tokens = h->ne[2];
+    const size_t  esz      = ggml_element_size(h);
+
+    ggml_tensor * kv = ggml_mul_mat(ctx0, layer.engram_wkv, lookup);
+
+    ggml_tensor * key   = ggml_view_3d(ctx0, kv, n_embd, hc, n_tokens, n_embd*esz, kv->nb[1], 0);
+    ggml_tensor * value = ggml_view_2d(ctx0, kv, n_embd, n_tokens, kv->nb[1], hc*n_embd*esz);
+
+    // q and k only ever appear as a product
+    ggml_tensor * w = ggml_mul(ctx0, layer.engram_q, layer.engram_k);
+
+    ggml_tensor * dot = ggml_mul(ctx0, ggml_rms_norm(ctx0, h, eps), ggml_rms_norm(ctx0, key, eps));
+    dot = ggml_sum_rows(ctx0, ggml_mul(ctx0, dot, w));
+    dot = ggml_scale(ctx0, dot, 1.0f/sqrtf((float) n_embd));
+
+    // signed sqrt before the sigmoid, matching the training kernel
+    ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, dot), 1e-6f, INFINITY));
+    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, dot), mag));
+
+    ggml_tensor * v = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, value, n_embd, 1, n_tokens),
+                                     n_embd, hc, n_tokens, 1);
+
+    return ggml_add(ctx0, h, ggml_mul(ctx0, v, gate));
+}
+
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     if (hparams.n_layer_nextn > 0 && hparams.n_layer_nextn < hparams.n_layer_all) {
@@ -51,6 +84,28 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     ml.get_key(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
 
+    // DeepSeek-V4.1 conditional memory. Absent in V4, so every read is optional and the whole
+    // feature stays inert when engram_n_layer is 0.
+    bool engram_present = false;
+    ml.get_key(LLM_KV_ENGRAM_PRESENT, engram_present, false);
+    if (engram_present) {
+        uint32_t n_engram_layer = 0;
+        ml.get_arr_n(LLM_KV_ENGRAM_LAYER_IDS, n_engram_layer);
+        if (n_engram_layer > hparams.engram_layer_ids.size()) {
+            throw std::runtime_error("DeepSeek-V4.1: too many engram layers");
+        }
+        ml.get_arr(LLM_KV_ENGRAM_LAYER_IDS, hparams.engram_layer_ids);
+        hparams.engram_n_layer = n_engram_layer;
+
+        ml.get_key(LLM_KV_ENGRAM_HEAD_DIM,   hparams.engram_head_dim);
+        ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT, hparams.engram_n_head);
+        ml.get_key(LLM_KV_ENGRAM_MAX_NGRAM,  hparams.engram_max_ngram);
+        ml.get_key(LLM_KV_ENGRAM_PAD_TOKEN,  hparams.engram_pad_token);
+        ml.get_arr(LLM_KV_ENGRAM_NUM_EMBD,   hparams.engram_num_embd);
+
+        hparams.engram_n_hash_cols = (hparams.engram_max_ngram - 1) * hparams.engram_n_head;
+    }
+
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
     uint32_t n_compress_ratios = 0;
@@ -59,6 +114,33 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error("DeepSeek-V4 compress_ratios is shorter than block_count");
     }
     ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS, hparams.dsv4_compress_ratios);
+
+    {
+        // V4.1 lists the source layers; V4 does not, and there the ratio decides
+        std::array<uint32_t, LLAMA_MAX_LAYERS> ids = {};
+        uint32_t n = 0;
+
+        ml.get_arr_n(LLM_KV_KV_SOURCE_LAYER_IDS, n, false);
+        if (n > 0) {
+            ml.get_arr(LLM_KV_KV_SOURCE_LAYER_IDS, ids);
+            for (uint32_t i = 0; i < n; ++i) {
+                hparams.dsv4_is_kv_source[ids[i]] = true;
+            }
+
+            n = 0;
+            ml.get_arr_n(LLM_KV_INDEX_SOURCE_LAYER_IDS, n, false);
+            ml.get_arr(LLM_KV_INDEX_SOURCE_LAYER_IDS, ids);
+            for (uint32_t i = 0; i < n; ++i) {
+                hparams.dsv4_is_index_source[ids[i]] = true;
+            }
+        } else {
+            for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                const uint32_t r = hparams.dsv4_compress_ratios[il];
+                hparams.dsv4_is_kv_source[il]    = r != 0;
+                hparams.dsv4_is_index_source[il] = r == 4;
+            }
+        }
+    }
 
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC, hparams.expert_gating_func);
     if (hparams.expert_gating_func != LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
@@ -99,9 +181,22 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
-    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, 0);
-    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, 0);
-    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+    if (hparams.engram_n_layer > 0) {
+        const int64_t n_hash_cols = hparams.engram_n_hash_cols;
+
+        engram_token_map   = create_tensor(tn(LLM_TENSOR_ENGRAM_TOKEN_MAP,   "weight"), {n_vocab}, 0);
+        engram_primes      = create_tensor(tn(LLM_TENSOR_ENGRAM_PRIMES,      "weight"), {n_hash_cols, hparams.engram_n_layer}, 0);
+        engram_offsets     = create_tensor(tn(LLM_TENSOR_ENGRAM_OFFSETS,     "weight"), {n_hash_cols, hparams.engram_n_layer}, 0);
+        engram_multipliers = create_tensor(tn(LLM_TENSOR_ENGRAM_MULTIPLIERS, "weight"), {hparams.engram_max_ngram, hparams.engram_n_layer}, 0);
+    }
+
+    // V4 has dedicated weights for the final hc collapse; V4.1 does not and reuses the last
+    // layer's ffn mix, so these are optional
+    const int hc_head_opt = arch == LLM_ARCH_DEEPSEEK41 ? TENSOR_NOT_REQUIRED : 0;
+
+    hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN, "weight"),    {hc_dim, hc_mult}, hc_head_opt);
+    hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE, "weight"),  {hc_mult}, hc_head_opt);
+    hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, hc_head_opt);
 
     for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
@@ -127,19 +222,26 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
         layer.hc_ffn_scale  = create_tensor(tn(LLM_TENSOR_HC_FFN_SCALE,  "weight", i), {3}, flags);
 
         const int64_t ratio = hparams.dsv4_compress_ratios[i];
-        if (ratio != 0) {
+        if (hparams.dsv4_is_kv_source[i]) {
             const int64_t coff = ratio == 4 ? 2 : 1;
+            // a ratio-1 compressor degenerates to norm(wkv(x)): no gate, and V4.1 has no ape
+            const int gate_flags = ratio > 1 ? flags : (flags | TENSOR_NOT_REQUIRED);
+            const int ape_flags  = arch == LLM_ARCH_DEEPSEEK41 ? (flags | TENSOR_NOT_REQUIRED) : flags;
 
             layer.attn_comp_wkv   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   "weight", i), {n_embd, coff * n_embd_head}, flags);
-            layer.attn_comp_wgate = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, "weight", i), {n_embd, coff * n_embd_head}, flags);
-            layer.attn_comp_ape   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_APE,   "weight", i), {coff * n_embd_head, ratio}, flags);
+            layer.attn_comp_wgate = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, "weight", i), {n_embd, coff * n_embd_head}, gate_flags);
+            layer.attn_comp_ape   = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_APE,   "weight", i), {coff * n_embd_head, ratio}, ape_flags);
             layer.attn_comp_norm  = create_tensor(tn(LLM_TENSOR_ATTN_COMPRESSOR_NORM,  "weight", i), {n_embd_head}, flags);
 
-            if (ratio == 4) {
+            if (arch == LLM_ARCH_DEEPSEEK41) {
                 const int64_t n_embd_indexer = hparams.indexer_head_size;
 
-                layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head}, flags);
-                layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * n_embd_indexer}, flags);
+                // V4.1 projects the indexer keys directly instead of compressing them
+                layer.indexer_attn_k = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K, "weight", i), {n_embd_head, n_embd_indexer}, flags | TENSOR_ALLOW_RESHAPE);
+                layer.indexer_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {n_embd_indexer}, flags);
+            } else if (ratio == 4) {
+                const int64_t n_embd_indexer = hparams.indexer_head_size;
+
 
                 layer.indexer_comp_wkv   = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WKV,   "weight", i), {n_embd, 2 * n_embd_indexer}, flags);
                 layer.indexer_comp_wgate = create_tensor(tn(LLM_TENSOR_INDEXER_COMPRESSOR_WGATE, "weight", i), {n_embd, 2 * n_embd_indexer}, flags);
@@ -148,6 +250,29 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
             } else if (ratio != 128) {
                 throw std::runtime_error("DeepSeek-V4 loader only supports compression ratios 0, 4, and 128");
             }
+        }
+
+        for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
+            if ((int) hparams.engram_layer_ids[e] != i) {
+                continue;
+            }
+
+            const int64_t head_dim    = hparams.engram_head_dim;
+            const int64_t n_hash_cols = hparams.engram_n_hash_cols;
+            const int64_t n_rows      = hparams.engram_num_embd[e];
+
+            layer.engram_embd       = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBED,       "weight", i), {head_dim, n_rows}, flags);
+            layer.engram_embd_scale = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBED_SCALE, "weight", i), {head_dim/32, n_rows}, flags);
+            layer.engram_wkv        = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV,         "weight", i), {n_hash_cols*head_dim, n_embd*(hc_mult + 1)}, flags);
+            layer.engram_q          = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,           "weight", i), {n_embd, hc_mult}, flags);
+            layer.engram_k          = create_tensor(tn(LLM_TENSOR_ENGRAM_K,           "weight", i), {n_embd, hc_mult}, flags);
+        }
+
+        if (hparams.dsv4_is_index_source[i]) {
+            const int64_t n_embd_indexer = hparams.indexer_head_size;
+
+            layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, hparams.indexer_n_head}, flags);
+            layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, hparams.indexer_n_head * n_embd_indexer}, flags);
         }
 
         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, flags);
@@ -1282,6 +1407,22 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
     ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
 
+    llm_graph_input_engram * inp_engram = nullptr;
+    if (hparams.engram_n_layer > 0) {
+        auto inp = std::make_unique<llm_graph_input_engram>(hparams, model, inp_dsv4->mctx);
+        inp->kv.resize(hparams.engram_n_layer);
+
+        for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
+            inp->kv[e] = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
+                    hparams.engram_n_hash_cols*hparams.engram_head_dim, n_tokens);
+            ggml_set_input(inp->kv[e]);
+            cb(inp->kv[e], "engram_lookup", e);
+        }
+
+        inp_engram = inp.get();
+        res->add_input(std::move(inp));
+    }
+
     const int64_t hc = hparams.dsv4_hc_mult;
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
@@ -1292,6 +1433,17 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
+        if (inp_engram) {
+            for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
+                if ((int) hparams.engram_layer_ids[e] != il) {
+                    continue;
+                }
+
+                inpL = dsv4_engram(ctx0, hparams.f_norm_rms_eps, model.layers[il], inp_engram->kv[e], inpL);
+                cb(inpL, "engram_out", il);
+            }
         }
 
         ggml_tensor * residual = inpL;
@@ -1389,7 +1541,12 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         inpL = ggml_reshape_3d(ctx0, flat_out, n_embd, hc, n_outputs);
     }
 
-    cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    // no dedicated head weights: fall back to the last layer's ffn mix, as the reference does
+    cur = model.hc_head_fn
+        ? build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base)
+        : build_hc_head(inpL, model.layers[n_layer - 1].hc_ffn_fn,
+                              model.layers[n_layer - 1].hc_ffn_scale,
+                              model.layers[n_layer - 1].hc_ffn_base);
     cb(cur, "hc_head", -1);
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
@@ -1527,7 +1684,12 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     inpL = ggml_reshape_3d(ctx0, h_nextn, n_embd, hc, n_outputs);
 
-    cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    // no dedicated head weights: fall back to the last layer's ffn mix, as the reference does
+    cur = model.hc_head_fn
+        ? build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base)
+        : build_hc_head(inpL, model.layers[n_layer - 1].hc_ffn_fn,
+                              model.layers[n_layer - 1].hc_ffn_scale,
+                              model.layers[n_layer - 1].hc_ffn_base);
     cb(cur, "mtp_hc_head", -1);
 
     ggml_tensor * head_norm_w = layer.nextn.shared_head_norm ? layer.nextn.shared_head_norm : model.output_norm;

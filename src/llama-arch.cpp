@@ -78,6 +78,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_DEEPSEEK2OCR,     "deepseek2-ocr"    },
     { LLM_ARCH_DEEPSEEK32,       "deepseek32"       },
     { LLM_ARCH_DEEPSEEK4,        "deepseek4"        },
+    { LLM_ARCH_DEEPSEEK41,       "deepseek41"       },
     { LLM_ARCH_CHATGLM,          "chatglm"          },
     { LLM_ARCH_GLM4,             "glm4"             },
     { LLM_ARCH_GLM4_MOE,         "glm4moe"          },
@@ -272,6 +273,15 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_HYPER_CONNECTION_EPSILON,               "%s.hyper_connection.epsilon"               },
 
     { LLM_KV_HASH_LAYER_COUNT,                       "%s.hash_layer_count"                       },
+    { LLM_KV_ENGRAM_LAYER_IDS,                       "%s.engram.layer_ids"                       },
+    { LLM_KV_ENGRAM_HEAD_DIM,                        "%s.engram_head_dim"                        },
+    { LLM_KV_ENGRAM_HEAD_COUNT,                      "%s.engram_n_heads"                         },
+    { LLM_KV_ENGRAM_MAX_NGRAM,                       "%s.engram_max_ngram_size"                  },
+    { LLM_KV_ENGRAM_PAD_TOKEN,                       "%s.engram_pad_token_id"                    },
+    { LLM_KV_ENGRAM_PRESENT,                         "%s.engram.present"                         },
+    { LLM_KV_ENGRAM_NUM_EMBD,                        "%s.engram.num_embeddings"                  },
+    { LLM_KV_KV_SOURCE_LAYER_IDS,                    "%s.kv_source_layer_ids"                    },
+    { LLM_KV_INDEX_SOURCE_LAYER_IDS,                 "%s.index_source_layer_ids"                 },
 
     { LLM_KV_ROPE_DIMENSION_COUNT,           "%s.rope.dimension_count"                 },
     { LLM_KV_ROPE_DIMENSION_COUNT_SWA,       "%s.rope.dimension_count_swa"             },
@@ -612,6 +622,15 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_INDEXER_COMPRESSOR_APE,                 "blk.%d.indexer_compressor_ape" },
     { LLM_TENSOR_INDEXER_COMPRESSOR_NORM,                "blk.%d.indexer_compressor_norm" },
     { LLM_TENSOR_FFN_GATE_TID2EID,                       "blk.%d.ffn_gate_tid2eid" },
+    { LLM_TENSOR_ENGRAM_EMBED,                           "blk.%d.engram_embd" },
+    { LLM_TENSOR_ENGRAM_EMBED_SCALE,                     "blk.%d.engram_embd_scale" },
+    { LLM_TENSOR_ENGRAM_WKV,                             "blk.%d.engram_wkv" },
+    { LLM_TENSOR_ENGRAM_Q,                               "blk.%d.engram_q" },
+    { LLM_TENSOR_ENGRAM_K,                               "blk.%d.engram_k" },
+    { LLM_TENSOR_ENGRAM_TOKEN_MAP,                       "engram_token_map" },
+    { LLM_TENSOR_ENGRAM_PRIMES,                          "engram_primes" },
+    { LLM_TENSOR_ENGRAM_OFFSETS,                         "engram_offsets" },
+    { LLM_TENSOR_ENGRAM_MULTIPLIERS,                     "engram_multipliers" },
     { LLM_TENSOR_MASKED_EMBD_CENTROIDS,                  "masked_embd_centroids" },
     { LLM_TENSOR_MASKED_EMBD_ORDERING,                   "masked_embd_ordering" },
     { LLM_TENSOR_FC,                                     "fc" },
@@ -853,6 +872,16 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_INDEXER_COMPRESSOR_APE,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
     {LLM_TENSOR_INDEXER_COMPRESSOR_NORM,    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_FFN_GATE_TID2EID,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
+    // the engram table and its scales are gathered on the host, not by a graph op
+    {LLM_TENSOR_ENGRAM_EMBED,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE}},
+    {LLM_TENSOR_ENGRAM_EMBED_SCALE,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_NONE}},
+    {LLM_TENSOR_ENGRAM_WKV,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ENGRAM_Q,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ENGRAM_K,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_ENGRAM_TOKEN_MAP,           {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
+    {LLM_TENSOR_ENGRAM_PRIMES,              {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
+    {LLM_TENSOR_ENGRAM_OFFSETS,             {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
+    {LLM_TENSOR_ENGRAM_MULTIPLIERS,         {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
     {LLM_TENSOR_NEXTN_PROJ_PRE,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_NEXTN_PROJ_POST,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     // NextN/MTP tensors are stored per-block (blk.%d.nextn.*) even though only the
@@ -969,6 +998,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
             return true;
         default:
             return false;
@@ -992,6 +1022,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
             return true;
         default:
             return false;
@@ -1014,6 +1045,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:

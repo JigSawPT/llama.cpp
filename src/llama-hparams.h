@@ -241,6 +241,21 @@ struct llama_hparams {
     uint32_t dsv4_hc_mult              = 0;
     uint32_t dsv4_hc_sinkhorn_iters    = 0;
     uint32_t dsv4_hash_layer_count     = 0;
+
+    // DeepSeek-V4.1 engram (conditional memory). engram_n_layer == 0 means no engram.
+    uint32_t engram_n_layer     = 0;
+    uint32_t engram_head_dim    = 0;
+    uint32_t engram_n_head      = 0;
+    uint32_t engram_max_ngram   = 0;
+    uint32_t engram_pad_token   = 0;
+    uint32_t engram_n_hash_cols = 0;  // (max_ngram - 1) * n_head
+    // V4.1 only: which layers produce the compressed KV and which run their own indexer query.
+    // V4 has neither key and falls back to the compression ratio.
+    std::array<bool, LLAMA_MAX_LAYERS> dsv4_is_kv_source    = {};
+    std::array<bool, LLAMA_MAX_LAYERS> dsv4_is_index_source = {};
+
+    std::array<uint32_t, LLAMA_MAX_LAYERS> engram_layer_ids = {};
+    std::array<uint32_t, LLAMA_MAX_LAYERS> engram_num_embd  = {};
     float    dsv4_compress_rope_base   = 0.0f;
     float    dsv4_hc_eps               = 0.0f;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;

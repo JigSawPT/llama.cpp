@@ -2374,6 +2374,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
+        model.arch == LLM_ARCH_DEEPSEEK41 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
@@ -2389,7 +2390,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         //   layer. Same plan as build_moe_ffn, from the same function, so the budget cannot drift
         //   away from the graph it is budgeting for.
         const llama_moe_stream_wave_budget wb = llama_moe_stream_wave_plan(
-                mstream->n_slots, model.hparams.n_expert, model.hparams.n_expert_used, n_tokens);
+                mstream->n_slots - mstream->pin_budget, model.hparams.n_expert, model.hparams.n_expert_used, n_tokens);
         // only STREAMED layers produce wave nodes; layers[] carries a null for every other one
         uint32_t n_streamed = 0;
         for (const auto & sl : mstream->layers) {
@@ -3594,7 +3595,7 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
+    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;
     }
