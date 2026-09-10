@@ -10,6 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <fstream>
+#include <sstream>
+#include <string>
 
 #ifdef _WIN32
 #include <malloc.h>
@@ -443,6 +446,32 @@ ggml_tensor * llama_moe_stream::create_cache_tensor(
         sl->route_total.resize(n_expert, 0);
         sl->seen         .resize(n_expert, 0);
         sl->keep         .resize(n_slots, 0);
+        sl->expert_pinned.resize(n_expert, 0);
+        sl->slot_pinned  .resize(n_slots, 0);
+        // JigSaw (21/08): marca os N primeiros da linha desta camada como pinaveis.
+        if (pin_budget > 0) {
+            const char * pl = std::getenv("LLAMA_MOE_STREAM_PIN_LIST");
+            const int pin_n = (int) pin_budget; // ja clampado no resolve
+            if (pl) {
+                std::ifstream f(pl);
+                std::string linha;
+                int marcados = 0;
+                while (std::getline(f, linha)) {
+                    std::istringstream iss(linha);
+                    int lil = -1; iss >> lil;
+                    if (lil != il) continue;
+                    int id, k = 0;
+                    while (k < pin_n && (iss >> id)) {
+                        if (id >= 0 && id < (int) n_expert) { sl->expert_pinned[id] = 1; marcados++; }
+                        k++;
+                    }
+                    break;
+                }
+                if (marcados > 0) {
+                    LLAMA_LOG_WARN("moe stream: JigSaw layer %d: %d experts pinaveis\n", il, marcados);
+                }
+            }
+        }
     }
     GGML_ASSERT(sl->n_expert == n_expert);
 
@@ -689,6 +718,9 @@ int32_t llama_moe_stream::pick_victim_locked(llama_moe_stream_layer & sl, const 
         if ((keep && keep[s]) || sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_LOADING) {
             continue;
         }
+        if (!sl.slot_pinned.empty() && sl.slot_pinned[s]) {   // JigSaw: pinado = intocavel
+            continue;
+        }
         if (sl.slot_state[s] == LLAMA_MOE_STREAM_SLOT_EMPTY) {
             return s;
         }
@@ -709,6 +741,11 @@ int32_t llama_moe_stream::pick_victim_locked(llama_moe_stream_layer & sl, const 
 // bind expert -> slot and mark it LOADING: evict the slot's prior occupant, bump slot_gen (so any
 // in-flight load for the old occupant is recognized as stale), and update the expert_slot index
 void llama_moe_stream::reserve_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot) {
+    // JigSaw: o pin segue o expert. Slot que recebe expert pinavel fica intocavel; slot
+    // reutilizado para outro expert perde o pin (so acontece se o anterior nao era pinado).
+    if (!sl.slot_pinned.empty()) {
+        sl.slot_pinned[slot] = (expert >= 0 && sl.expert_pinned[expert]) ? 1 : 0;
+    }
     if (sl.slot_expert[slot] >= 0) {
         if (debug) {
             LLAMA_LOG_DEBUG("%s: layer %d: evict expert %d from slot %d\n", __func__, sl.il, sl.slot_expert[slot], slot);
@@ -777,6 +814,11 @@ void llama_moe_stream::print_stats(const char * role) const {
     LLAMA_LOG_WARN("%s: %smoe stream: remap calls = %" PRId64 ", expert hits = %" PRId64 ", misses = %" PRId64 " (%" PRId64 " cold), hit rate = %.2f%%\n",
             __func__, pfx, stats.n_calls, stats.n_hit, stats.n_miss, stats.n_miss_cold,
             n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
+    if (stats.n_hit_pin > 0) {
+        LLAMA_LOG_WARN("%s: %smoe stream: JigSaw pinned hits = %" PRId64 " (%.2f%% dos hits)\n",
+                __func__, pfx, stats.n_hit_pin,
+                stats.n_hit > 0 ? 100.0*stats.n_hit_pin/stats.n_hit : 0.0);
+    }
     LLAMA_LOG_WARN("%s: %smoe stream: load stall = %.2f ms total (%.3f ms per remap call)\n",
             __func__, pfx, stats.t_stall_us/1000.0, stats.n_calls > 0 ? stats.t_stall_us/1000.0/stats.n_calls : 0.0);
     LLAMA_LOG_INFO("%s: %smoe stream: slot wait = %.2f ms total over %" PRId64 " waits (%.1f%% of the two stalls)\n",
@@ -1007,6 +1049,7 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
                 waited = true;
             }
             mgr->stats.n_hit++;
+            if (sl->slot_pinned[s]) mgr->stats.n_hit_pin++;
             sl->keep[s] = 1;
             sl->demand_slots.push_back(s);
         } else {
@@ -1154,6 +1197,7 @@ void llama_moe_stream::stage_wave_locked(std::unique_lock<std::mutex> & lk, llam
                     stats.n_preload_ready++; // resident from the previous wave's preload
                 }
                 stats.n_hit++;
+                if (sl.slot_pinned[s]) stats.n_hit_pin++;
                 sl.keep[s] = 1;
                 sl.demand_slots.push_back(s);
             } else {

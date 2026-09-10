@@ -97,6 +97,14 @@ struct llama_moe_stream_layer {
     std::vector<int32_t> uniq;
     std::vector<uint8_t> touched;
     std::vector<uint8_t> keep;         // [n_slots] slots the current call must not evict
+    // JigSaw (21/08): experts PINADOS - imunes ao despejo. A cache dinamica (route_hotness
+    // + LRU) adapta-se, mas um expert quente pode ser despejado num desvio de carga e cada
+    // regresso paga um miss. O pin da estabilidade ao nucleo que o perfil offline diz ser
+    // estavel, e deixa a dinamica so para a cauda.
+    //   LLAMA_MOE_STREAM_PIN_LIST = ficheiro "il id id ..." (formato do aipc-moe-profile)
+    //   LLAMA_MOE_STREAM_PIN_N    = quantos por camada pinar (0 = desligado)
+    std::vector<uint8_t> expert_pinned; // [n_expert] 1 = pinar quando carregar
+    std::vector<uint8_t> slot_pinned;   // [n_slots]  1 = nunca despejar
     std::vector<int32_t> demand_slots; // slots the current call waits on
 
     // wave plan for multi-pass prefill (guarded by mgr->mtx): the touched experts are split into
@@ -326,6 +334,11 @@ struct llama_moe_stream {
     // line ("target: moe stream: ..."). One process holds one manager per model, so without it
     // two blocks are separable only by their order - which is not a property a parser can rely
     // on. nullptr prints no prefix at all and reproduces the pre-role output byte for byte.
+    // JigSaw: quantos slots por camada podem ficar pinados (0 = pinning desligado).
+    // Clampado a n_slots - 3*n_expert_used no resolve (llama-model.cpp) - os pins sao
+    // slots EXTRA acima do minimo dinamico, senao o plano de vagas encrava (22/08).
+    uint32_t pin_budget = 0;
+
     void print_stats(const char * role) const;
     void print_locality(const char * pfx) const; // expert selection concentration; called from print_stats
 
@@ -388,6 +401,7 @@ struct llama_moe_stream {
     struct {
         int64_t n_calls     = 0; // remap invocations
         int64_t n_hit       = 0; // touched experts already resident or loading
+        int64_t n_hit_pin   = 0; // JigSaw: hits servidos por slots pinados
         int64_t n_miss      = 0; // demand loads issued
         int64_t n_miss_cold = 0; // first-ever touch of an expert
         int64_t t_stall_us  = 0; // wait time in miss handling, from the point every miss is issued
