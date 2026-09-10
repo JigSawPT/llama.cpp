@@ -847,7 +847,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     const int64_t nt                       = cur->ne[1];
 
     GGML_ASSERT(score_mask);
-    GGML_ASSERT(inp_lid.k_rot);
+    // k_rot is optional: it is an orthogonal rotation applied to both sides of the dot
+    // product, so leaving it off q and k alike is the identity. V4.1 has none, because a
+    // shared rotation needs the full head dim to match the indexer's, and here it does not.
     GGML_ASSERT(n_embd_indexer_head >= n_embd_indexer_head_rope);
 
     ggml_tensor * indexer_q = build_lora_mm(layer.indexer_attn_q_b, qr);
@@ -869,7 +871,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     cb(indexer_q_pe, "lid_q_pe", il);
 
     indexer_q = ggml_concat(ctx0, indexer_q_nope, indexer_q_pe, 0);
-    indexer_q = llama_mul_mat_hadamard(ctx0, indexer_q, inp_lid.k_rot);
+    if (inp_lid.k_rot) {
+        indexer_q = llama_mul_mat_hadamard(ctx0, indexer_q, inp_lid.k_rot);
+    }
     cb(indexer_q, "lid_q_rot", il);
 
     ggml_tensor * indexer_weights = build_lora_mm(layer.indexer_proj, cur);
@@ -1531,13 +1535,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
                 1.0f/sqrtf(float(n_embd_head)), il);
         cb(out, "attn_raw", il);
     } else if (ratio == csa_ratio &&
-            inp_dsv4->get_csa().kq_mask &&
-            inp_dsv4->get_lid().k_rot) {
+            inp_dsv4->get_csa().kq_mask) {
         out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, layer.attn_sinks,
                 1.0f/sqrtf(float(n_embd_head)), false, il, topk_carry);
     } else if (ratio == hca_ratio && !inp_dsv4->mctx->get_comp_overlap() &&
-            inp_dsv4->get_hca().kq_mask &&
-            inp_dsv4->get_lid().k_rot) {
+            inp_dsv4->get_hca().kq_mask) {
         // V4.1 has no second attention flavour: the ratio-1 group picks with the indexer too
         out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, layer.attn_sinks,
                 1.0f/sqrtf(float(n_embd_head)), true, il, topk_carry);
