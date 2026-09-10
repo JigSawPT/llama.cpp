@@ -147,6 +147,10 @@ public:
     uint32_t get_csa_ratio() const { return csa_ratio; }
     uint32_t get_hca_ratio() const { return hca_ratio; }
 
+    // V4 pools overlapping groups (its compressor is twice as wide); V4.1 pools disjoint
+    // ones, like the reference's unflatten(1, (-1, ratio))
+    bool get_comp_overlap() const { return comp_overlap; }
+
     // Compressed token ids per (sequence, position), for the engram n-gram lookback. Empty when
     // the model has no engram. ENGRAM_NONE marks a position that was never written.
     static constexpr int32_t ENGRAM_NONE = -2;
@@ -177,6 +181,7 @@ private:
     // V4 uses 4 and 128; V4.1 uses 2 and 1. Order is first-seen among the non-zero values.
     const uint32_t csa_ratio;
     const uint32_t hca_ratio;
+    const bool     comp_overlap;
 
     std::vector<uint32_t> rs_idx;
 
@@ -402,6 +407,14 @@ private:
 
     const uint32_t csa_ratio = 0;
     const uint32_t hca_ratio = 0;
+
+public:
+    // the graph classifies layers by these too, and must not re-derive them
+    uint32_t get_csa_ratio() const { return csa_ratio; }
+    uint32_t get_hca_ratio() const { return hca_ratio; }
+    bool get_comp_overlap() const { return kv->get_comp_overlap(); }
+
+private:
 
     std::vector<comp_plan> plans_csa;
     std::vector<comp_plan> plans_hca;

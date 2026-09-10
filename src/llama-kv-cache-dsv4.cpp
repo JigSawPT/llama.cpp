@@ -1202,6 +1202,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     n_rs_seq(n_rs_seq),
     csa_ratio(dsv4_comp_ratios(model).first),
     hca_ratio(dsv4_comp_ratios(model).second),
+    comp_overlap(model.arch != LLM_ARCH_DEEPSEEK41),
     rs_idx(n_seq_max, 0) {
 
     if (model.hparams.engram_n_layer > 0) {
@@ -2047,13 +2048,13 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     kv(kv),
     csa_ratio(kv->get_csa_ratio()),
     hca_ratio(kv->get_hca_ratio()),
-    plans_csa(dsv4_build_comp_plans(this->ubatches, csa_ratio, true,
+    plans_csa(dsv4_build_comp_plans(this->ubatches, csa_ratio, kv->get_comp_overlap(),
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
     plans_hca(dsv4_build_comp_plans(this->ubatches, hca_ratio, false,
                 kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
-    plans_lid(dsv4_build_comp_plans(this->ubatches, csa_ratio, true,
+    plans_lid(dsv4_build_comp_plans(this->ubatches, csa_ratio, kv->get_comp_overlap(),
                 kv->get_lid_state()->get_state_size(), kv->get_lid()->get_size(), kv->get_lid_state()->get_n_stream(),
                 kv->get_n_rs_seq(), kv->get_rs_idx())),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(

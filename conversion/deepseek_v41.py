@@ -28,6 +28,11 @@ class DeepseekV41Model(DeepseekV4Model):
 
     convert_engram = False
 
+    # The V4.1 MTP block is not the V4 one: it has main_proj/main_norm/markov_head/confidence_head
+    # and none of the nextn.e_proj/h_proj/enorm/hnorm that generate_extra_tensors looks for.
+    # Refusing --mtp is honest; mapping those five names is a separate piece of work.
+    supports_mtp_export = False
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.hparams["num_hash_layers"] = 0  # V4 gate tid2eid table, absent in V4.1
