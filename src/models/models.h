@@ -1152,7 +1152,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 int il,
-                ggml_tensor ** topk_carry = nullptr) const;
+                ggml_tensor ** topk_carry = nullptr,
+                ggml_tensor ** cand_carry = nullptr) const;
 
         ggml_tensor * build_attention(
                 const llama_model & model,
@@ -1168,7 +1169,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 int il,
-                ggml_tensor ** topk_carry) const;
+                ggml_tensor ** topk_carry,
+                ggml_tensor ** cand_carry) const;
 
         ggml_tensor * build_hca_compressed_kv_from_state(
                 ggml_tensor * kv_state,
@@ -1204,6 +1206,13 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * write_idxs,
                 int il) const;
 
+        // V4.1 first level: keep the highest scoring blocks of compressed positions. Returns
+        // null when every block fits the top-k, where the selection is provably the identity.
+        ggml_tensor * build_candidate_mask(
+                ggml_tensor * index_score,
+                ggml_tensor * cand_pin,
+                int il) const;
+
         ggml_tensor * build_lid_top_k(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
@@ -1211,6 +1220,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 ggml_tensor * score_mask,
+                ggml_tensor * inp_lid_pin,
+                ggml_tensor ** cand_carry,
                 int il) const;
 
         ggml_tensor * build_top_k_mask(
@@ -1232,7 +1243,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 float kq_scale,
                 bool use_hca,
                 int il,
-                ggml_tensor ** topk_carry) const;
+                ggml_tensor ** topk_carry,
+                ggml_tensor ** cand_carry) const;
 
         ggml_tensor * build_hca_attention(
                 llm_graph_input_dsv4 * inp_dsv4,

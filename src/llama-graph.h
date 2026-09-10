@@ -575,6 +575,11 @@ public:
 
         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
 
+        // V4.1 first-level indexer: +inf on the block holding each query's newest compressed
+        // position, 0 elsewhere. Null when the model has no block selection, or when every
+        // block fits in the top-k and the selection is provably the identity.
+        ggml_tensor * cand_pin   = nullptr; // F32 [n_kv/block, n_batch/n_stream, 1, n_stream]
+
         ggml_tensor * k_rot      = nullptr;
     };
 

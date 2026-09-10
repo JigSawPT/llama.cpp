@@ -3595,20 +3595,6 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (model->arch == LLM_ARCH_DEEPSEEK41) {
-        // The indexer picks in two levels. The first one, candidate block selection, is not
-        // ported yet. It is provably the identity while every block fits in the top-k, that is
-        // up to candidate_block_size * candidate_topk_blocks compressed positions, and the
-        // candidate source compresses at ratio 1, so that bound is in tokens.
-        // Proof: bench/dsv41/prova_blocos_candidatos.py.
-        const uint32_t limit = model->hparams.dsv4_candidate_block_size * model->hparams.dsv4_candidate_topk_blocks;
-        if (limit > 0 && params.n_ctx > limit) {
-            LLAMA_LOG_ERROR("%s: n_ctx %u exceeds %u, above which DEEPSEEK41 needs the candidate "
-                    "block selection that is not implemented yet\n", __func__, params.n_ctx, limit);
-            return nullptr;
-        }
-    }
-
     if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
         return nullptr;

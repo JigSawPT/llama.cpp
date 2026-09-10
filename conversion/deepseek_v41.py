@@ -47,6 +47,7 @@ class DeepseekV41Model(DeepseekV4Model):
         return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
 
     _ENGRAM_RAW = ".engram.embed."
+    _BYTES_1 = (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8, torch.int8)
 
     def keeps_raw_dtype(self, name: str) -> bool:
         # the engram table travels as raw fp8 bytes; f32 would be 393 GiB per layer
@@ -180,7 +181,10 @@ class DeepseekV41Model(DeepseekV4Model):
                 # the table stays as raw bytes: 24 rows per token are gathered and dequantized
                 # on the host, and dequantizing 384M rows would need 393 GiB per layer.
                 # keeps_raw_dtype kept the storage intact, so the view is over fp8, not floats.
-                if data_torch.element_size() != 1:
+                # dtype comes off the meta tensor; element_size() is a method, and asking a
+                # lazy tensor for one materializes it -- 91 GiB, which is what this guard is
+                # here to prevent in the first place
+                if data_torch.dtype not in self._BYTES_1:
                     raise ValueError(f"{name}: expected raw fp8 bytes, got {data_torch.dtype}")
                 return [(out, data_torch.view(torch.uint8))]
             return [(out, data_torch)]

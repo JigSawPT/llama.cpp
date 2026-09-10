@@ -157,6 +157,12 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
+    {
+        uint32_t src = 0;
+        if (ml.get_key(LLM_KV_CANDIDATE_SOURCE_LAYER, src, false)) {
+            hparams.dsv4_candidate_source_layer = (int32_t) src;
+        }
+    }
     ml.get_key(LLM_KV_CANDIDATE_BLOCK_SIZE,  hparams.dsv4_candidate_block_size,  false);
     ml.get_key(LLM_KV_CANDIDATE_TOPK_BLOCKS, hparams.dsv4_candidate_topk_blocks, false);
 
@@ -830,6 +836,59 @@ ggml_tensor * llama_model_deepseek4::graph::build_v41_index_key(
     return inp_dsv4->mctx->get_lid()->cpy_k(ctx0, k, write_idxs, il);
 }
 
+ggml_tensor * llama_model_deepseek4::graph::build_candidate_mask(
+        ggml_tensor * index_score,
+        ggml_tensor * cand_pin,
+        int il) const {
+    if (!cand_pin) {
+        // every block fits the top-k, and there the selection cannot remove anything the
+        // consumer's own causality has not removed already
+        return nullptr;
+    }
+
+    const int64_t n_pos    = index_score->ne[0];
+    const int64_t n_blocks = cand_pin->ne[0];
+    const int64_t topb     = hparams.dsv4_candidate_topk_blocks;
+
+    GGML_ASSERT(n_blocks > 0 && n_pos%n_blocks == 0);
+    const int64_t block = n_pos/n_blocks;
+
+    // one score per block: its best position. Unreachable positions arrive at -inf.
+    ggml_tensor * bs = ggml_cont(ctx0, index_score);
+    bs = ggml_pool_2d(ctx0, bs, GGML_OP_POOL_MAX, (int) block, 1, (int) block, 1, 0, 0);
+    cb(bs, "cand_block_score", il);
+
+    // the block holding the newest position is only half full and could be outscored by an
+    // older, full one, so it is pinned in
+    bs = ggml_add(ctx0, bs, cand_pin);
+
+    const int64_t k = topb < n_blocks ? topb : n_blocks;
+    ggml_tensor * top = ggml_cont(ctx0, ggml_top_k(ctx0, bs, (int) k));
+
+    // -inf everywhere, 0 on the blocks that were kept
+    ggml_tensor * keep = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_blocks, bs->ne[1], bs->ne[3]);
+    keep = ggml_fill(ctx0, keep, -INFINITY);
+
+    ggml_tensor * top3 = ggml_view_4d(ctx0, top, top->ne[0], top->ne[1], top->ne[3], 1,
+            top->nb[1], top->nb[2], top->ne[3]*top->nb[3], 0);
+
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top3->ne[0], top3->ne[1], top3->ne[2]);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+    keep = ggml_set_rows(ctx0, keep, zeros, top3);
+    keep = ggml_view_4d(ctx0, keep, keep->ne[1], keep->ne[2], 1, keep->ne[3],
+            keep->nb[2], keep->nb[3], keep->nb[3], 0);
+    cb(keep, "cand_keep", il);
+
+    // back from blocks to positions: every position inherits its block's verdict
+    keep = ggml_reshape_4d(ctx0, keep, 1, n_blocks, keep->ne[1], keep->ne[3]);
+    keep = ggml_repeat_4d(ctx0, keep, block, n_blocks, keep->ne[2], keep->ne[3]);
+    keep = ggml_reshape_4d(ctx0, keep, n_pos, keep->ne[2], 1, keep->ne[3]);
+    cb(keep, "cand_mask", il);
+
+    return keep;
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         const llama_model & model,
         llm_graph_input_dsv4 * inp_dsv4,
@@ -837,6 +896,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
         ggml_tensor * score_mask,
+        ggml_tensor * inp_lid_pin,
+        ggml_tensor ** cand_carry,
         int il) const {
     const auto & layer = model.layers[il];
     const auto & inp_lid = inp_dsv4->get_lid();
@@ -928,6 +989,17 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
         cb(indexer_score, "lid_score_masked", il);
     }
 
+    // level one: the candidate source publishes the block mask and the layers after it apply
+    // it before picking positions. Layers at or before the source ignore it.
+    if (cand_carry != nullptr) {
+        if (hparams.dsv4_candidate_source_layer >= 0 && il == hparams.dsv4_candidate_source_layer) {
+            *cand_carry = build_candidate_mask(indexer_score, inp_lid_pin, il);
+        } else if (*cand_carry != nullptr) {
+            indexer_score = ggml_add(ctx0, indexer_score, *cand_carry);
+            cb(indexer_score, "lid_score_candidates", il);
+        }
+    }
+
     const uint32_t n_top_k = indexer_score->ne[0] < hparams.indexer_top_k ? indexer_score->ne[0] : hparams.indexer_top_k;
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
     cb(top_k, "lid_top_k", il);
@@ -977,7 +1049,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         float kq_scale,
         bool use_hca,
         int il,
-        ggml_tensor ** topk_carry) const {
+        ggml_tensor ** topk_carry,
+        ggml_tensor ** cand_carry) const {
     // V4.1 runs this shape for both compressed groups; V4 only for the csa one
     const auto & inp_csa = use_hca ? inp_dsv4->get_hca() : inp_dsv4->get_csa();
     GGML_ASSERT(inp_csa.kq_mask);
@@ -985,7 +1058,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // only an index source owns an indexer; the layers after it reuse what it picked
     ggml_tensor * top_k = nullptr;
     if (topk_carry == nullptr || hparams.dsv4_is_index_source[il]) {
-        top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, inp_csa.kq_mask, il);
+        top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, inp_csa.kq_mask,
+                inp_csa.cand_pin, cand_carry, il);
         if (topk_carry) {
             *topk_carry = top_k;
         }
@@ -1141,8 +1215,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
         int il,
-        ggml_tensor ** topk_carry) const {
-    return build_attention_impl(model, inp_dsv4, nullptr, cur, inp_pos, il, topk_carry);
+        ggml_tensor ** topk_carry,
+        ggml_tensor ** cand_carry) const {
+    return build_attention_impl(model, inp_dsv4, nullptr, cur, inp_pos, il, topk_carry, cand_carry);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_attention(
@@ -1151,7 +1226,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
         int il) const {
-    return build_attention_impl(model, nullptr, inp_mtp, cur, inp_pos, il, nullptr);
+    return build_attention_impl(model, nullptr, inp_mtp, cur, inp_pos, il, nullptr, nullptr);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
@@ -1161,7 +1236,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
         int il,
-        ggml_tensor ** topk_carry) const {
+        ggml_tensor ** topk_carry,
+        ggml_tensor ** cand_carry) const {
     GGML_ASSERT((inp_dsv4 == nullptr) != (inp_mtp == nullptr));
 
     const auto & layer = model.layers[il];
@@ -1538,12 +1614,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
     } else if (ratio == csa_ratio &&
             inp_dsv4->get_csa().kq_mask) {
         out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, layer.attn_sinks,
-                1.0f/sqrtf(float(n_embd_head)), false, il, topk_carry);
+                1.0f/sqrtf(float(n_embd_head)), false, il, topk_carry, cand_carry);
     } else if (ratio == hca_ratio && !inp_dsv4->mctx->get_comp_overlap() &&
             inp_dsv4->get_hca().kq_mask) {
         // V4.1 has no second attention flavour: the ratio-1 group picks with the indexer too
         out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, layer.attn_sinks,
-                1.0f/sqrtf(float(n_embd_head)), true, il, topk_carry);
+                1.0f/sqrtf(float(n_embd_head)), true, il, topk_carry, cand_carry);
     } else if (ratio == hca_ratio &&
             inp_dsv4->get_hca().kq_mask) {
         out = build_hca_attention(inp_dsv4, inp_attn, q, kv, layer.attn_sinks,
@@ -1615,6 +1691,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     // the compressed positions the last index source picked, reused by the layers after it
     ggml_tensor * topk_carry_v = nullptr;
 
+    // the block mask the candidate source published, applied by every layer after it
+    ggml_tensor * cand_carry_v = nullptr;
+
     const int64_t hc = hparams.dsv4_hc_mult;
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
@@ -1652,7 +1731,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_attention(model, inp_dsv4, cur, inp_pos, il, &topk_carry_v);
+        cur = build_attention(model, inp_dsv4, cur, inp_pos, il, &topk_carry_v, &cand_carry_v);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);

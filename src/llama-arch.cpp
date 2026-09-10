@@ -280,6 +280,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ENGRAM_PAD_TOKEN,                       "%s.engram_pad_token_id"                    },
     { LLM_KV_ENGRAM_PRESENT,                         "%s.engram.present"                         },
     { LLM_KV_ENGRAM_NUM_EMBD,                        "%s.engram.num_embeddings"                  },
+    { LLM_KV_CANDIDATE_SOURCE_LAYER,                 "%s.attention.candidate_source_layer_id"   },
     { LLM_KV_CANDIDATE_BLOCK_SIZE,                   "%s.attention.candidate_block_size"         },
     { LLM_KV_CANDIDATE_TOPK_BLOCKS,                  "%s.attention.candidate_topk_blocks"        },
     { LLM_KV_KV_SOURCE_LAYER_IDS,                    "%s.kv_source_layer_ids"                    },

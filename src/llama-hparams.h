@@ -255,6 +255,7 @@ struct llama_hparams {
     // preceding kv source; V4 gives every layer its own, so there this is the identity.
     // first level of the V4.1 indexer: it is the identity while every block fits in the
     // top-k, which bounds the context this port can serve exactly
+    int32_t  dsv4_candidate_source_layer = -1;
     uint32_t dsv4_candidate_block_size  = 0;
     uint32_t dsv4_candidate_topk_blocks = 0;
 
