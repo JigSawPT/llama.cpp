@@ -972,12 +972,23 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
         ggml_tensor * sinks,
         float kq_scale,
         bool use_hca,
-        int il) const {
+        int il,
+        ggml_tensor ** topk_carry) const {
     // V4.1 runs this shape for both compressed groups; V4 only for the csa one
     const auto & inp_csa = use_hca ? inp_dsv4->get_hca() : inp_dsv4->get_csa();
     GGML_ASSERT(inp_csa.kq_mask);
 
-    ggml_tensor * top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, inp_csa.kq_mask, il);
+    // only an index source owns an indexer; the layers after it reuse what it picked
+    ggml_tensor * top_k = nullptr;
+    if (topk_carry == nullptr || hparams.dsv4_is_index_source[il]) {
+        top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, inp_csa.kq_mask, il);
+        if (topk_carry) {
+            *topk_carry = top_k;
+        }
+    } else {
+        top_k = *topk_carry;
+        GGML_ASSERT(top_k && "DSV4: layer reuses a top-k no index source produced");
+    }
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
     if (k_rot) {
@@ -1125,8 +1136,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         llm_graph_input_dsv4 * inp_dsv4,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        int il) const {
-    return build_attention_impl(model, inp_dsv4, nullptr, cur, inp_pos, il);
+        int il,
+        ggml_tensor ** topk_carry) const {
+    return build_attention_impl(model, inp_dsv4, nullptr, cur, inp_pos, il, topk_carry);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_attention(
@@ -1135,7 +1147,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention(
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
         int il) const {
-    return build_attention_impl(model, nullptr, inp_mtp, cur, inp_pos, il);
+    return build_attention_impl(model, nullptr, inp_mtp, cur, inp_pos, il, nullptr);
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
@@ -1144,7 +1156,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         llm_graph_input_attn_k_iswa * inp_mtp,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        int il) const {
+        int il,
+        ggml_tensor ** topk_carry) const {
     GGML_ASSERT((inp_dsv4 == nullptr) != (inp_mtp == nullptr));
 
     const auto & layer = model.layers[il];
@@ -1521,13 +1534,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
             inp_dsv4->get_csa().kq_mask &&
             inp_dsv4->get_lid().k_rot) {
         out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, layer.attn_sinks,
-                1.0f/sqrtf(float(n_embd_head)), false, il);
+                1.0f/sqrtf(float(n_embd_head)), false, il, topk_carry);
     } else if (ratio == hca_ratio && !inp_dsv4->mctx->get_comp_overlap() &&
             inp_dsv4->get_hca().kq_mask &&
             inp_dsv4->get_lid().k_rot) {
         // V4.1 has no second attention flavour: the ratio-1 group picks with the indexer too
         out = build_csa_lid_attention(model, inp_dsv4, inp_attn, q, kv, qr, cur, inp_pos, layer.attn_sinks,
-                1.0f/sqrtf(float(n_embd_head)), true, il);
+                1.0f/sqrtf(float(n_embd_head)), true, il, topk_carry);
     } else if (ratio == hca_ratio &&
             inp_dsv4->get_hca().kq_mask) {
         out = build_hca_attention(inp_dsv4, inp_attn, q, kv, layer.attn_sinks,
@@ -1596,6 +1609,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     ggml_tensor *  hc_carry_v = nullptr;
     ggml_tensor ** hc_carry   = arch == LLM_ARCH_DEEPSEEK41 ? &hc_carry_v : nullptr;
 
+    // the compressed positions the last index source picked, reused by the layers after it
+    ggml_tensor * topk_carry_v = nullptr;
+
     const int64_t hc = hparams.dsv4_hc_mult;
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
@@ -1633,7 +1649,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_attention(model, inp_dsv4, cur, inp_pos, il);
+        cur = build_attention(model, inp_dsv4, cur, inp_pos, il, &topk_carry_v);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);

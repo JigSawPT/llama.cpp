@@ -1144,12 +1144,15 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * hc_scale,
                 ggml_tensor * hc_base) const;
 
+        // topk_carry holds the compressed positions the last index source picked; layers that
+        // are not index sources reuse it instead of running an indexer they do not have
         ggml_tensor * build_attention(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il) const;
+                int il,
+                ggml_tensor ** topk_carry = nullptr) const;
 
         ggml_tensor * build_attention(
                 const llama_model & model,
@@ -1164,7 +1167,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 llm_graph_input_attn_k_iswa * inp_mtp,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                int il) const;
+                int il,
+                ggml_tensor ** topk_carry) const;
 
         ggml_tensor * build_hca_compressed_kv_from_state(
                 ggml_tensor * kv_state,
@@ -1227,7 +1231,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * sinks,
                 float kq_scale,
                 bool use_hca,
-                int il) const;
+                int il,
+                ggml_tensor ** topk_carry) const;
 
         ggml_tensor * build_hca_attention(
                 llm_graph_input_dsv4 * inp_dsv4,
