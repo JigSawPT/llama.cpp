@@ -568,7 +568,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         }
     }
 
-    if (overlap && !plan.state_pos.empty()) {
+    // the dummy block keeps the plan non-empty so the graph shapes stay constant when no group
+    // completes in this ubatch. It is not overlap-specific: append_dummy_block already handles
+    // both, and with ratio 2 a decode step closes a group only every other token.
+    if (!plan.state_pos.empty()) {
         assert(kv_size > 0);
 
         // Pad each stream to the reserve plan's block count.
@@ -2235,7 +2238,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
     }
 
     reserve_plan_csa = dsv4_build_reserve_comp_plan(
-            ubatch, csa_ratio, true,
+            ubatch, csa_ratio, kv->get_comp_overlap(),
             csa_state->get_state_size(), get_csa()->get_n_kv(), csa_state->get_n_stream(), csa_state->get_n_rs_seq());
 
     return reserve_plan_csa;
@@ -2263,7 +2266,7 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
     }
 
     reserve_plan_lid = dsv4_build_reserve_comp_plan(
-            ubatch, csa_ratio, true,
+            ubatch, csa_ratio, kv->get_comp_overlap(),
             lid_state->get_state_size(), get_lid()->get_n_kv(), lid_state->get_n_stream(), lid_state->get_n_rs_seq());
 
     return reserve_plan_lid;

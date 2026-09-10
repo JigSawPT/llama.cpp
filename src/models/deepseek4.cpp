@@ -1480,7 +1480,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         }
     }
 
-    if (ratio == hca_ratio && inp_dsv4->get_hca().state_pos) {
+    // only a source produced the state this block persists
+    if (ratio == hca_ratio && hparams.dsv4_is_kv_source[il] && inp_dsv4->get_hca().state_pos) {
         GGML_ASSERT(hca_state_kv);
         GGML_ASSERT(hca_state_score);
 
