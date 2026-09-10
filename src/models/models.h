@@ -1175,7 +1175,8 @@ struct llama_model_deepseek4 : public llama_model_base {
                 int64_t ratio,
                 int64_t n_embd_head,
                 const char * name,
-                int il) const;
+                int il,
+                ggml_tensor ** pre_rope = nullptr) const;
 
         ggml_tensor * build_overlap_compressed_kv_from_state(
                 ggml_tensor * kv_state,
@@ -1186,6 +1187,17 @@ struct llama_model_deepseek4 : public llama_model_base {
                 int64_t ratio,
                 int64_t n_embd_head,
                 const char * name,
+                int il,
+                ggml_tensor ** pre_rope = nullptr) const;
+
+        // V4.1 derives the index keys from the attention compressor's latent instead of
+        // running a second compressor of its own
+        ggml_tensor * build_v41_index_key(
+                const llama_model & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                ggml_tensor * latent,
+                ggml_tensor * comp_pos,
+                ggml_tensor * write_idxs,
                 int il) const;
 
         ggml_tensor * build_lid_top_k(
@@ -1194,6 +1206,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * qr,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
+                ggml_tensor * score_mask,
                 int il) const;
 
         ggml_tensor * build_top_k_mask(
@@ -1213,6 +1226,7 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor * inp_pos,
                 ggml_tensor * sinks,
                 float kq_scale,
+                bool use_hca,
                 int il) const;
 
         ggml_tensor * build_hca_attention(

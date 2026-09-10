@@ -251,6 +251,10 @@ struct llama_hparams {
     uint32_t engram_n_hash_cols = 0;  // (max_ngram - 1) * n_head
     // V4.1 only: which layers produce the compressed KV and which run their own indexer query.
     // V4 has neither key and falls back to the compression ratio.
+    // which layer's compressed caches this one reads. V4.1 shares them from the nearest
+    // preceding kv source; V4 gives every layer its own, so there this is the identity.
+    std::array<int32_t, LLAMA_MAX_LAYERS> dsv4_kv_src_layer = {};
+
     std::array<bool, LLAMA_MAX_LAYERS> dsv4_is_kv_source    = {};
     std::array<bool, LLAMA_MAX_LAYERS> dsv4_is_index_source = {};
 

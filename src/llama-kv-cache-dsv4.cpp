@@ -1254,7 +1254,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             return false;
         }
 
-        return model.hparams.dsv4_compress_ratios[il] == csa_ratio;
+        // only a source owns storage; V4 marks every compressing layer as a source
+        return model.hparams.dsv4_is_kv_source[il] && model.hparams.dsv4_compress_ratios[il] == csa_ratio;
     };
 
     const layer_filter_cb filter_hca = [&](int32_t il) {
@@ -1262,7 +1263,17 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             return false;
         }
 
-        return model.hparams.dsv4_compress_ratios[il] == hca_ratio;
+        return model.hparams.dsv4_is_kv_source[il] && model.hparams.dsv4_compress_ratios[il] == hca_ratio;
+    };
+
+    // the index keys live only where a layer both owns KV and runs an indexer. For V4 that is
+    // exactly ratio == 4, which is what filter_csa selected before.
+    const layer_filter_cb filter_lid = [&](int32_t il) {
+        if (filter && !filter(il)) {
+            return false;
+        }
+
+        return model.hparams.dsv4_is_kv_source[il] && model.hparams.dsv4_is_index_source[il];
     };
 
     const bool unified_compressed = false;
@@ -1283,19 +1294,24 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, hca_ratio), 256u), n_seq_max, n_pad,
             0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
 
+    // the index keys sit one per compressed position, so the cache has to fit the finest
+    // ratio any source layer compresses at. V4 has a single indexer ratio and is unaffected.
+    const uint32_t lid_ratio = csa_ratio < hca_ratio ? csa_ratio : hca_ratio;
+
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
-            __func__, dsv4_comp_size(kv_size, csa_ratio));
+            __func__, dsv4_comp_size(kv_size, lid_ratio));
 
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
-            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, csa_ratio), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, lid_ratio), 256u), n_seq_max, n_pad,
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_lid, nullptr, nullptr);
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressor state\n", __func__);
 
     csa_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, csa_ratio, 2*csa_ratio,
-            2*model.hparams.n_embd_head_k(), n_rs_seq, "csa", filter_csa);
+            model, offload, unified_compressed, n_seq_max, csa_ratio,
+            comp_overlap ? 2*csa_ratio : csa_ratio,
+            (comp_overlap ? 2 : 1)*model.hparams.n_embd_head_k(), n_rs_seq, "csa", filter_csa);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressor state\n", __func__);
 
@@ -1306,8 +1322,9 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer compressor state\n", __func__);
 
     lid_state = std::make_unique<llama_dsv4_comp_state>(
-            model, offload, unified_compressed, n_seq_max, csa_ratio, 2*csa_ratio,
-            2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
+            model, offload, unified_compressed, n_seq_max, csa_ratio,
+            comp_overlap ? 2*csa_ratio : csa_ratio,
+            (comp_overlap ? 2 : 1)*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_lid);
 
     // DSV4 attention reads compressed-K / compressor-state rows that the current
     // graph does not necessarily overwrite; uninitialized buffer contents would
