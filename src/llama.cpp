@@ -304,22 +304,16 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        if (params.moe_stream) {
-            // mmap prefetches the whole file into RAM (MAP_POPULATE / MADV_WILLNEED), which loads
-            // the streamed experts too and defeats streaming - forcing an OOM on a model >> RAM
-            //
-            // upstream clears a use_mmap flag here; b10223 folded that flag into the load_mode
-            // enum, so the equivalent is to drop the mmap bit and keep the mlock bit the mode carried
-            const enum llama_load_mode without_mmap =
-                params.load_mode == LLAMA_LOAD_MODE_MMAP       ? LLAMA_LOAD_MODE_NONE  :
-                params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK ? LLAMA_LOAD_MODE_MLOCK : params.load_mode;
-
-            if (without_mmap != params.load_mode) {
-                LLAMA_LOG_WARN("%s: disabling mmap because MoE expert streaming is enabled (%s -> %s)\n", __func__,
-                        llama_load_mode_name(params.load_mode), llama_load_mode_name(without_mmap));
-                params.load_mode = without_mmap;
-            }
-        }
+        // mmap used to be disabled here: it prefetched the whole file into RAM, which pulled
+        // in the streamed experts too and defeated streaming on a model much larger than RAM.
+        // The prefetch is bounded now -- llama_model_loader::init_mappings refuses it when the
+        // file does not fit in free memory -- so the reason is gone, and keeping mmap off has a
+        // cost that only shows on a model with host-read tables: they get allocated instead of
+        // mapped. Measured on V4.1-Flash with the engram, 193 GiB of CPU buffer and 217 GiB of
+        // commit on a 125 GiB machine.
+        //
+        // The experts are unaffected either way: they are TENSOR_STREAMED, the loader skips
+        // them, and llama_moe_stream does its own I/O.
 
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
