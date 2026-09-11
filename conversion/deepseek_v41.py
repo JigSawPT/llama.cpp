@@ -186,6 +186,12 @@ class DeepseekV41Model(DeepseekV4Model):
         logger.info("engram: hash tables written, compressed vocab %d, primes sum matches both tables",
                     n_compressed)
 
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        # last, on purpose: these two tables are read a few rows at a time by the host, and
+        # the loader prefetches from the start of the file. Putting them at the front means
+        # the prefetch pulls in 189 GiB nobody needs and evicts the weights that matter.
         self._write_engram_rows()
 
     def _write_engram_rows(self) -> None:

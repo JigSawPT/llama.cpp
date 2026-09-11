@@ -1359,7 +1359,34 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch ? -1 : 0, is_numa);
+            // Prefetching more than fits in RAM does not help: the system fills the page
+            // cache and then evicts what it just brought in. Cap it at the free memory less
+            // the headroom the machine needs to stay out of paging. A model that fits is
+            // unaffected -- the mapping takes min(size, prefetch) either way.
+            size_t prefetch_bytes = 0;
+            if (prefetch) {
+                prefetch_bytes = (size_t) -1;
+
+                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (cpu_dev) {
+                    size_t free_mem = 0, total_mem = 0;
+                    ggml_backend_dev_memory(cpu_dev, &free_mem, &total_mem);
+
+                    const size_t headroom = 8ull*1024*1024*1024;
+                    if (free_mem > headroom) {
+                        prefetch_bytes = free_mem - headroom;
+                    } else if (free_mem > 0) {
+                        prefetch_bytes = 0;
+                    }
+                }
+
+                if (prefetch_bytes != (size_t) -1 && prefetch_bytes < file->size()) {
+                    LLAMA_LOG_INFO("%s: prefetching %.1f GiB of %.1f GiB (capped by free memory)\n",
+                            __func__, prefetch_bytes/1073741824.0, file->size()/1073741824.0);
+                }
+            }
+
+            std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_bytes, is_numa);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
