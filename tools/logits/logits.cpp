@@ -113,12 +113,13 @@ static void uso(const char * exe) {
     printf("  --moe-stream      stream routed experts from disk\n");
     printf("  --moe-stream-cache N   expert cache budget in GiB\n");
     printf("  --moe-stream-l2 N      host RAM tier in GiB\n");
+    printf("  --moe-stream-io-threads N   expert load I/O threads (1 makes slot assignment timing-free)\n");
     printf("  --no-bos          do not prepend BOS when tokenizing -p\n");
 }
 
 int main(int argc, char ** argv) {
     std::string modelo, prompt, saida, lista_tokens, lista_camadas, lista_nos;
-    int   ngl = 0, n_ctx = 0, moe_cache_gib = 0, moe_l2_gib = 0, n_ubatch = 0;
+    int   ngl = 0, n_ctx = 0, moe_cache_gib = 0, moe_l2_gib = 0, n_ubatch = 0, moe_io_threads = 0;
     bool  moe_stream = false, add_bos = true;
 
     for (int i = 1; i < argc; i++) {
@@ -136,6 +137,7 @@ int main(int argc, char ** argv) {
         else if (a == "--moe-stream")          moe_stream    = true;
         else if (a == "--moe-stream-cache")  { moe_cache_gib = atoi(proximo("--moe-stream-cache").c_str()); moe_stream = true; }
         else if (a == "--moe-stream-l2")     { moe_l2_gib    = atoi(proximo("--moe-stream-l2").c_str());    moe_stream = true; }
+        else if (a == "--moe-stream-io-threads") { moe_io_threads = atoi(proximo("--moe-stream-io-threads").c_str()); moe_stream = true; }
         else if (a == "--layers")              lista_camadas = proximo("--layers");
         else if (a == "--dump")                lista_nos     = proximo("--dump");
         else if (a == "--tokens-file") {
@@ -170,6 +172,7 @@ int main(int argc, char ** argv) {
     mp.moe_stream        = moe_stream;
     mp.moe_stream_budget = (uint64_t) moe_cache_gib * 1024ull*1024ull*1024ull;
     mp.moe_stream_l2_gib = (uint32_t) moe_l2_gib;
+    mp.moe_stream_io_threads = moe_io_threads;
 
     llama_model * model = llama_model_load_from_file(modelo.c_str(), mp);
     if (!model) {
