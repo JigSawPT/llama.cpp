@@ -9,6 +9,7 @@
 // not be part of what is being compared.
 
 #include "llama.h"
+#include "llama-ext.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -20,6 +21,7 @@
 static void uso(const char * exe) {
     printf("usage: %s -m model.gguf [-p prompt | --tokens 1,2,3] -o out.bin\n", exe);
     printf("  -ngl N            layers on the GPU\n");
+    printf("  --layers a,b,c    also dump the input of these layers (mean over the hc copies)\n");
     printf("  -c N              context size (default: prompt length rounded up)\n");
     printf("  --moe-stream      stream routed experts from disk\n");
     printf("  --moe-stream-cache N   expert cache budget in GiB\n");
@@ -28,7 +30,7 @@ static void uso(const char * exe) {
 }
 
 int main(int argc, char ** argv) {
-    std::string modelo, prompt, saida, lista_tokens;
+    std::string modelo, prompt, saida, lista_tokens, lista_camadas;
     int   ngl = 0, n_ctx = 0, moe_cache_gib = 0, moe_l2_gib = 0;
     bool  moe_stream = false, add_bos = true;
 
@@ -47,6 +49,7 @@ int main(int argc, char ** argv) {
         else if (a == "--moe-stream")          moe_stream    = true;
         else if (a == "--moe-stream-cache")  { moe_cache_gib = atoi(proximo("--moe-stream-cache").c_str()); moe_stream = true; }
         else if (a == "--moe-stream-l2")     { moe_l2_gib    = atoi(proximo("--moe-stream-l2").c_str());    moe_stream = true; }
+        else if (a == "--layers")              lista_camadas = proximo("--layers");
         else if (a == "--no-bos")              add_bos       = false;
         else { uso(argv[0]); return 1; }
     }
@@ -105,6 +108,19 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    std::vector<uint32_t> camadas;
+    if (!lista_camadas.empty()) {
+        size_t pos = 0;
+        while (pos < lista_camadas.size()) {
+            size_t virgula = lista_camadas.find(',', pos);
+            if (virgula == std::string::npos) virgula = lista_camadas.size();
+            const uint32_t lid = (uint32_t) atoi(lista_camadas.substr(pos, virgula - pos).c_str());
+            camadas.push_back(lid);
+            llama_set_embeddings_layer_inp(ctx, lid, true);
+            pos = virgula + 1;
+        }
+    }
+
     printf("logits: %zu tokens:", tokens.size());
     for (const llama_token t : tokens) {
         printf(" %d", t);
@@ -131,6 +147,27 @@ int main(int argc, char ** argv) {
     }
     fwrite(lg, sizeof(float), n_vocab, f);
     fclose(f);
+
+    for (const uint32_t lid : camadas) {
+        const float * h = llama_get_embeddings_layer_inp(ctx, lid);
+        if (!h) {
+            fprintf(stderr, "layer %u: no data\n", lid);
+            continue;
+        }
+
+        const int n_embd = llama_model_n_embd(model);
+        char nome[1024];
+        snprintf(nome, sizeof(nome), "%s.layer%u.bin", saida.c_str(), lid);
+
+        FILE * fl = fopen(nome, "wb");
+        if (fl) {
+            // the last position only: one vector per layer is enough to find where two
+            // implementations start to disagree
+            fwrite(h + (size_t)(tokens.size() - 1)*n_embd, sizeof(float), n_embd, fl);
+            fclose(fl);
+            printf("logits: layer %u -> %s (%d values)\n", lid, nome, n_embd);
+        }
+    }
 
     std::vector<int> ord(n_vocab);
     for (int i = 0; i < n_vocab; i++) ord[i] = i;

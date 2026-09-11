@@ -1702,12 +1702,6 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     cb(inpL, "hc_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
-        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
-            res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
-            cb(res->t_layer_inp[il], "layer_inp", il);
-            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
-        }
-
         if (inp_engram) {
             for (uint32_t e = 0; e < hparams.engram_n_layer; ++e) {
                 if ((int) hparams.engram_layer_ids[e] != il) {
@@ -1717,6 +1711,15 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 inpL = dsv4_engram(ctx0, hparams.f_norm_rms_eps, model.layers[il], inp_engram->kv[e], inpL);
                 cb(inpL, "engram_out", il);
             }
+        }
+
+        // after the engram, as the reference does: it applies the engram before taking
+        // h.mean(dim=2) for the MTP. No target layer carries an engram in this checkpoint,
+        // so nothing changes today, but the two definitions now agree.
+        if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
+            cb(res->t_layer_inp[il], "layer_inp", il);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
 
         ggml_tensor * residual = inpL;
