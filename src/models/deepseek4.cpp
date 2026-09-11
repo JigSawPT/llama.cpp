@@ -1282,8 +1282,12 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
-    q = ggml_rms_norm(ctx0, q, norm_rms_eps);
-    cb(q, "q_norm", il);
+    if (arch != LLM_ARCH_DEEPSEEK41) {
+        // V4 normalises each head of q after wq_b; V4.1 does not, and doing it anyway pins
+        // every head to RMS 1, which is where its attention output lost a fifth of its norm
+        q = ggml_rms_norm(ctx0, q, norm_rms_eps);
+        cb(q, "q_norm", il);
+    }
 
     ggml_tensor * q_nope = ggml_view_3d(ctx0, q, n_embd_head_nope, n_head, nt,
             ggml_row_size(q->type, n_embd_head),

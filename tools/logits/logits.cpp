@@ -10,6 +10,8 @@
 
 #include "llama.h"
 #include "llama-ext.h"
+#include "ggml.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -18,10 +20,70 @@
 #include <string>
 #include <vector>
 
+// --dump: the graph already names its intermediates through cb(); the scheduler callback is
+// the existing way to read them. One file per node, float32, with a small header so the
+// reader does not have to know the shapes in advance.
+struct dump_state {
+    std::vector<std::string> nomes;
+    std::string              prefixo;
+    int                      escritos = 0;
+};
+
+static bool dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    dump_state * st = (dump_state *) user_data;
+    const char * nome = ggml_get_name(t);
+    bool quer = false;
+    for (const std::string & n : st->nomes) {
+        if (n == nome) { quer = true; break; }
+    }
+    if (ask) {
+        return quer;
+    }
+    if (!quer) {
+        return true;
+    }
+
+    const int64_t n = ggml_nelements(t);
+    std::vector<char> bruto((size_t) ggml_nbytes(t));
+    ggml_backend_tensor_get(t, bruto.data(), 0, bruto.size());
+
+    std::vector<float> vals((size_t) n);
+    if (t->type == GGML_TYPE_F32) {
+        memcpy(vals.data(), bruto.data(), (size_t) n * sizeof(float));
+    } else {
+        const auto * tr = ggml_get_type_traits(t->type);
+        if (!tr->to_float) {
+            fprintf(stderr, "dump: %s has type %s, which cannot be read as float\n", nome, ggml_type_name(t->type));
+            return true;
+        }
+        tr->to_float(bruto.data(), vals.data(), n);
+    }
+
+    char caminho[1024];
+    snprintf(caminho, sizeof(caminho), "%s.%s.bin", st->prefixo.c_str(), nome);
+    FILE * f = fopen(caminho, "wb");
+    if (!f) {
+        fprintf(stderr, "dump: cannot write %s\n", caminho);
+        return true;
+    }
+    // header: magic, ne[4] as int64, then n floats
+    const char magia[8] = { 'D','S','V','4','D','M','P','1' };
+    fwrite(magia, 1, 8, f);
+    fwrite(t->ne, sizeof(int64_t), 4, f);
+    fwrite(vals.data(), sizeof(float), (size_t) n, f);
+    fclose(f);
+    st->escritos++;
+    printf("logits: dump %-24s [%5lld %5lld %5lld %5lld] %s -> %s\n", nome,
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            ggml_type_name(t->type), caminho);
+    return true;
+}
+
 static void uso(const char * exe) {
     printf("usage: %s -m model.gguf [-p prompt | --tokens 1,2,3] -o out.bin\n", exe);
     printf("  -ngl N            layers on the GPU\n");
     printf("  --layers a,b,c    also dump the input of these layers (mean over the hc copies)\n");
+    printf("  --dump n1,n2      also dump these graph nodes by name, e.g. attn_out-0,ffn_out-0\n");
     printf("  -c N              context size (default: prompt length rounded up)\n");
     printf("  --moe-stream      stream routed experts from disk\n");
     printf("  --moe-stream-cache N   expert cache budget in GiB\n");
@@ -30,7 +92,7 @@ static void uso(const char * exe) {
 }
 
 int main(int argc, char ** argv) {
-    std::string modelo, prompt, saida, lista_tokens, lista_camadas;
+    std::string modelo, prompt, saida, lista_tokens, lista_camadas, lista_nos;
     int   ngl = 0, n_ctx = 0, moe_cache_gib = 0, moe_l2_gib = 0;
     bool  moe_stream = false, add_bos = true;
 
@@ -50,6 +112,7 @@ int main(int argc, char ** argv) {
         else if (a == "--moe-stream-cache")  { moe_cache_gib = atoi(proximo("--moe-stream-cache").c_str()); moe_stream = true; }
         else if (a == "--moe-stream-l2")     { moe_l2_gib    = atoi(proximo("--moe-stream-l2").c_str());    moe_stream = true; }
         else if (a == "--layers")              lista_camadas = proximo("--layers");
+        else if (a == "--dump")                lista_nos     = proximo("--dump");
         else if (a == "--no-bos")              add_bos       = false;
         else { uso(argv[0]); return 1; }
     }
@@ -101,6 +164,20 @@ int main(int argc, char ** argv) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx   = n_ctx > 0 ? n_ctx : (uint32_t) tokens.size() + 8;
     cp.n_batch = (uint32_t) tokens.size();
+
+    dump_state despejo;
+    if (!lista_nos.empty()) {
+        size_t pos = 0;
+        while (pos < lista_nos.size()) {
+            size_t virgula = lista_nos.find(',', pos);
+            if (virgula == std::string::npos) virgula = lista_nos.size();
+            despejo.nomes.push_back(lista_nos.substr(pos, virgula - pos));
+            pos = virgula + 1;
+        }
+        despejo.prefixo         = saida;
+        cp.cb_eval              = dump_cb;
+        cp.cb_eval_user_data    = &despejo;
+    }
 
     llama_context * ctx = llama_init_from_model(model, cp);
     if (!ctx) {
