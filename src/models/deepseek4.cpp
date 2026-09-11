@@ -208,10 +208,10 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     if (hparams.engram_n_layer > 0) {
         const int64_t n_hash_cols = hparams.engram_n_hash_cols;
 
-        engram_token_map   = create_tensor(tn(LLM_TENSOR_ENGRAM_TOKEN_MAP,   "weight"), {n_vocab}, 0);
-        engram_primes      = create_tensor(tn(LLM_TENSOR_ENGRAM_PRIMES,      "weight"), {n_hash_cols, hparams.engram_n_layer}, 0);
-        engram_offsets     = create_tensor(tn(LLM_TENSOR_ENGRAM_OFFSETS,     "weight"), {n_hash_cols, hparams.engram_n_layer}, 0);
-        engram_multipliers = create_tensor(tn(LLM_TENSOR_ENGRAM_MULTIPLIERS, "weight"), {hparams.engram_max_ngram, hparams.engram_n_layer}, 0);
+        engram_token_map   = create_tensor(tn(LLM_TENSOR_ENGRAM_TOKEN_MAP,   "weight"), {n_vocab}, TENSOR_HOST);
+        engram_primes      = create_tensor(tn(LLM_TENSOR_ENGRAM_PRIMES,      "weight"), {n_hash_cols, hparams.engram_n_layer}, TENSOR_HOST);
+        engram_offsets     = create_tensor(tn(LLM_TENSOR_ENGRAM_OFFSETS,     "weight"), {n_hash_cols, hparams.engram_n_layer}, TENSOR_HOST);
+        engram_multipliers = create_tensor(tn(LLM_TENSOR_ENGRAM_MULTIPLIERS, "weight"), {hparams.engram_max_ngram, hparams.engram_n_layer}, TENSOR_HOST);
     }
 
     // V4 has dedicated weights for the final hc collapse; V4.1 does not and reuses the last
@@ -285,8 +285,8 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
             const int64_t n_hash_cols = hparams.engram_n_hash_cols;
             const int64_t n_rows      = hparams.engram_num_embd[e];
 
-            layer.engram_embd       = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBED,       "weight", i), {head_dim, n_rows}, flags);
-            layer.engram_embd_scale = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBED_SCALE, "weight", i), {head_dim/32, n_rows}, flags);
+            layer.engram_embd       = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBED,       "weight", i), {head_dim, n_rows}, flags | TENSOR_HOST);
+            layer.engram_embd_scale = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBED_SCALE, "weight", i), {head_dim/32, n_rows}, flags | TENSOR_HOST);
             layer.engram_wkv        = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV,         "weight", i), {n_hash_cols*head_dim, n_embd*(hc_mult + 1)}, flags);
             layer.engram_q          = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,           "weight", i), {n_embd, hc_mult}, flags);
             layer.engram_k          = create_tensor(tn(LLM_TENSOR_ENGRAM_K,           "weight", i), {n_embd, hc_mult}, flags);

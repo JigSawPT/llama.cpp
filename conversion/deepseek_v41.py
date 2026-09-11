@@ -49,6 +49,51 @@ class DeepseekV41Model(DeepseekV4Model):
     _ENGRAM_RAW = ".engram.embed."
     _BYTES_1 = (torch.float8_e4m3fn, torch.float8_e5m2, torch.uint8, torch.int8)
 
+    def _engram_memmap(self, name: str):
+        """A janela do safetensors onde a tabela vive, como memmap de bytes.
+
+        Devolve None se o tensor nao for encontrado, e nesse caso o caminho normal segue --
+        mais lento e a materializar, mas correcto."""
+        import glob
+        import io
+        import json
+        import os
+        import struct
+
+        if self._st_index is None:
+            idx = glob.glob(os.path.join(self.dir_model, "*.safetensors.index.json"))
+            if not idx:
+                return None
+            with io.open(idx[0], encoding="utf-8") as fh:
+                self._st_index = json.load(fh)["weight_map"]
+
+        ficheiro = self._st_index.get(name)
+        if ficheiro is None:
+            return None
+
+        caminho = os.path.join(self.dir_model, ficheiro)
+        cab = self._st_headers.get(caminho)
+        if cab is None:
+            with open(caminho, "rb") as fh:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                cab = (json.loads(fh.read(n)), 8 + n)
+            self._st_headers[caminho] = cab
+        meta, base = cab
+
+        e = meta[name]
+        inicio, fim = e["data_offsets"]
+        # bytes crus: a forma logica e [linhas, colunas], um byte por elemento
+        forma = tuple(e["shape"])
+        n_bytes = fim - inicio
+        if n_bytes != int(np.prod(forma)):
+            logger.warning("%s: %d bytes para uma forma de %s, memmap ignorado", name, n_bytes, forma)
+            return None
+
+        return np.memmap(caminho, dtype=np.uint8, mode="r", offset=base + inicio, shape=forma)
+
+    _st_index = None
+    _st_headers: dict = {}
+
     def keeps_raw_dtype(self, name: str) -> bool:
         # the engram table travels as raw fp8 bytes; f32 would be 393 GiB per layer
         return self._ENGRAM_RAW in name
@@ -184,8 +229,18 @@ class DeepseekV41Model(DeepseekV4Model):
                 # dtype comes off the meta tensor; element_size() is a method, and asking a
                 # lazy tensor for one materializes it -- 91 GiB, which is what this guard is
                 # here to prevent in the first place
-                if data_torch.dtype not in self._BYTES_1:
+                # itemsize belongs to the dtype, not the tensor, so asking does not
+                # materialize anything -- unlike element_size(), which is a method
+                if data_torch.dtype.itemsize != 1:
                     raise ValueError(f"{name}: expected raw fp8 bytes, got {data_torch.dtype}")
+                # tofile on a lazy tensor materializes it first, and this one is 91 GiB. A
+                # memmap over the source file is an ndarray the writer can walk without
+                # allocating anything: the bytes go out exactly as they came in.
+                mm = self._engram_memmap(name)
+                if mm is not None:
+                    logger.info("%s: %.1f GiB streamed by memmap, not materialized",
+                                name, mm.nbytes/2**30)
+                    return [(out, mm)]
                 return [(out, data_torch.view(torch.uint8))]
             return [(out, data_torch)]
         return super().modify_tensors(data_torch, name, bid)

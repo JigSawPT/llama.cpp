@@ -1115,8 +1115,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             throw std::runtime_error(format("missing tensor info mapping for %s", tn.str().c_str()));
         }
 
-        // skip unused tensors
-        if (info.op == GGML_OP_NONE || (flags & (TENSOR_SKIP | TENSOR_STREAMED))) {
+        // skip unused tensors. A host tensor is used -- just not by the graph.
+        if (!(flags & TENSOR_HOST) && (info.op == GGML_OP_NONE || (flags & (TENSOR_SKIP | TENSOR_STREAMED)))) {
             const size_t nbytes = ggml_nbytes(t_meta);
             if (flags & TENSOR_STREAMED) {
                 LLAMA_LOG_DEBUG("tensor %s is SSD-streamed (size = %zu bytes)\n", tn.str().c_str(), nbytes);
@@ -1156,6 +1156,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // select the buffer type for this tensor
         const buft_list_t * buft_list;
+        if (flags & TENSOR_HOST) {
+            // the host dereferences ->data, so it has to live where the host can reach it
+            buft_list = buft_list_cpu;
+        } else
         switch (info.layer) {
             case LLM_TENSOR_LAYER_INPUT:
                 buft_list = buft_list_input;
@@ -1199,6 +1203,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     break;
                 }
             }
+        }
+
+        if (!buft && (flags & TENSOR_HOST)) {
+            // no graph op runs on it, so there is nothing to ask the backend about
+            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (!cpu_dev) {
+                throw std::runtime_error("no CPU backend found");
+            }
+            buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
 
         if (!buft) {

@@ -75,6 +75,9 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_STREAMED        = 1 << 5;
+    // read by the host, never by the graph: allocated on the CPU list, and the backend is
+    // not asked whether it supports an op, because no op touches it
+    static const int TENSOR_HOST            = 1 << 6;
 
     // Two owners took bit 4 independently, and each was right on its own base:
     // upstream's TENSOR_ALLOW_RESHAPE arrived with #26577, ours was written against
@@ -88,9 +91,9 @@ struct llama_model_loader {
     // A flag added later is only covered once it is listed here.
     static_assert(
         (TENSOR_NOT_REQUIRED | TENSOR_DUPLICATED | TENSOR_SKIP | TENSOR_SKIP_IF_VIRTUAL |
-         TENSOR_ALLOW_RESHAPE | TENSOR_STREAMED) ==
+         TENSOR_ALLOW_RESHAPE | TENSOR_STREAMED | TENSOR_HOST) ==
         (TENSOR_NOT_REQUIRED + TENSOR_DUPLICATED + TENSOR_SKIP + TENSOR_SKIP_IF_VIRTUAL +
-         TENSOR_ALLOW_RESHAPE + TENSOR_STREAMED),
+         TENSOR_ALLOW_RESHAPE + TENSOR_STREAMED + TENSOR_HOST),
         "llama_model_loader tensor flags must use distinct bits");
 
     int n_kv      = 0;

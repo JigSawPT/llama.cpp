@@ -889,7 +889,9 @@ class ModelBase:
             for new_name, data_torch in (self.modify_tensors(data_torch, name, bid)):
                 # TODO: why do we squeeze here?
                 # data = data_torch.squeeze().numpy()
-                data = data_torch.numpy()
+                # modify_tensors may hand back a numpy array directly -- a memmap, for a tensor
+                # too large to materialize, which the writer can walk without allocating
+                data = data_torch.numpy() if hasattr(data_torch, "numpy") else data_torch
 
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
