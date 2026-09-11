@@ -555,6 +555,15 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
         return build_hc_pre(x, pre, il);
     }
 
+    // LLAMA_DSV41_NO_HC_THREAD=1 applies this sublayer's own mix instead of the carried one,
+    // which is what V4 does. The carry is still written, so the final collapse is unaffected
+    // and the A/B isolates exactly one thing: which mix each sublayer applies.
+    static const bool hc_thread_off = std::getenv("LLAMA_DSV41_NO_HC_THREAD") != nullptr;
+    if (hc_thread_off) {
+        *carry = pre;
+        return build_hc_pre(x, pre, il);
+    }
+
     // the mix computed here feeds the NEXT sublayer; collapse with the previous one's.
     // The first attention has no predecessor and the reference starts from a one-hot on
     // stream 0 (make_identity_pre_mix), which is just that stream.
