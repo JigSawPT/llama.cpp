@@ -3,7 +3,7 @@
 This branch runs [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)
 (552B MoE, 40 layers, 384 routed experts, a 189 GiB n-gram memory) on a single consumer GPU by
 streaming experts from NVMe through a two-tier cache (VRAM + pinned RAM). Measured on an RTX 5090
-with 32 GB of VRAM and 125.7 GiB of RAM: 5.1 tokens/s on new content, 21 tokens/s on resident
+with 31.8 GiB of VRAM (a 32 GB card) and 125.7 GiB of RAM: 5.1 tokens/s on new content, 21 tokens/s on resident
 content, logits within the reference's own fp8 rounding floor.
 
 The full report, the measurement tools and the raw results live in
