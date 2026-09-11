@@ -107,7 +107,9 @@ static void uso(const char * exe) {
     printf("  -ngl N            layers on the GPU\n");
     printf("  --layers a,b,c    also dump the input of these layers (mean over the hc copies)\n");
     printf("  --dump n1,n2      also dump these graph nodes by name, e.g. attn_out-0,ffn_out-0\n");
+    printf("  --tokens-file F   read the token ids from a file, for prompts too long for argv\n");
     printf("  -c N              context size (default: prompt length rounded up)\n");
+    printf("  -ub N             ubatch size (default: the whole prompt, one forward)\n");
     printf("  --moe-stream      stream routed experts from disk\n");
     printf("  --moe-stream-cache N   expert cache budget in GiB\n");
     printf("  --moe-stream-l2 N      host RAM tier in GiB\n");
@@ -116,7 +118,7 @@ static void uso(const char * exe) {
 
 int main(int argc, char ** argv) {
     std::string modelo, prompt, saida, lista_tokens, lista_camadas, lista_nos;
-    int   ngl = 0, n_ctx = 0, moe_cache_gib = 0, moe_l2_gib = 0;
+    int   ngl = 0, n_ctx = 0, moe_cache_gib = 0, moe_l2_gib = 0, n_ubatch = 0;
     bool  moe_stream = false, add_bos = true;
 
     for (int i = 1; i < argc; i++) {
@@ -136,6 +138,21 @@ int main(int argc, char ** argv) {
         else if (a == "--moe-stream-l2")     { moe_l2_gib    = atoi(proximo("--moe-stream-l2").c_str());    moe_stream = true; }
         else if (a == "--layers")              lista_camadas = proximo("--layers");
         else if (a == "--dump")                lista_nos     = proximo("--dump");
+        else if (a == "--tokens-file") {
+            // a long prompt does not fit in argv, and the selection logic of this model only
+            // does real work above a thousand tokens
+            const std::string caminho = proximo("--tokens-file");
+            FILE * ft = fopen(caminho.c_str(), "rb");
+            if (!ft) { fprintf(stderr, "cannot read %s\n", caminho.c_str()); return 1; }
+            std::string conteudo;
+            char buf[4096];
+            size_t nlidos;
+            while ((nlidos = fread(buf, 1, sizeof(buf), ft)) > 0) conteudo.append(buf, nlidos);
+            fclose(ft);
+            for (char & c : conteudo) { if (c == '\n' || c == '\r' || c == ' ') c = ','; }
+            lista_tokens = conteudo;
+        }
+        else if (a == "-ub")                   n_ubatch      = atoi(proximo("-ub").c_str());
         else if (a == "--no-bos")              add_bos       = false;
         else { uso(argv[0]); return 1; }
     }
@@ -168,7 +185,10 @@ int main(int argc, char ** argv) {
         while (pos < lista_tokens.size()) {
             size_t virgula = lista_tokens.find(',', pos);
             if (virgula == std::string::npos) virgula = lista_tokens.size();
-            tokens.push_back((llama_token) atoi(lista_tokens.substr(pos, virgula - pos).c_str()));
+            const std::string campo = lista_tokens.substr(pos, virgula - pos);
+            if (!campo.empty()) {
+                tokens.push_back((llama_token) atoi(campo.c_str()));
+            }
             pos = virgula + 1;
         }
     } else {
@@ -187,6 +207,10 @@ int main(int argc, char ** argv) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx   = n_ctx > 0 ? n_ctx : (uint32_t) tokens.size() + 8;
     cp.n_batch = (uint32_t) tokens.size();
+    // one ubatch for the whole prompt: the reference does a single forward, and a prefill
+    // split into 512-token chunks would carry compressor state across the split, so the
+    // comparison would be measuring the framing instead of the model
+    cp.n_ubatch = n_ubatch > 0 ? (uint32_t) n_ubatch : cp.n_batch;
 
     dump_state despejo;
     if (!lista_nos.empty()) {

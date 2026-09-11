@@ -358,6 +358,24 @@ llama_moe_stream::llama_moe_stream(uint32_t n_layer, uint32_t n_slots, int32_t n
     this->n_io_threads = n_io_threads <= 0 ? MOE_STREAM_IO_THREADS_DEFAULT : n_io_threads;
     this->n_io_threads = std::min<int32_t>(this->n_io_threads, MOE_STREAM_IO_THREADS_MAX);
 
+    // A4, prefetch oracle. Opt-in through the environment because it is a measurement
+    // apparatus, not a feature: LLAMA_MOE_STREAM_TRACE records the call sequence of a run,
+    // LLAMA_MOE_STREAM_ORACLE replays it as anticipation, and AHEAD says how many calls ahead.
+    if (const char * p = std::getenv("LLAMA_MOE_STREAM_TRACE")) {
+        spec_trace_path = p;
+    }
+    if (const char * p = std::getenv("LLAMA_MOE_STREAM_ORACLE")) {
+        load_oracle(p);
+    }
+    if (const char * p = std::getenv("LLAMA_MOE_STREAM_AHEAD")) {
+        spec_ahead = atoi(p);
+    }
+    if (spec_ahead > 0 && spec_oracle.empty()) {
+        LLAMA_LOG_WARN("%s: moe stream: LLAMA_MOE_STREAM_AHEAD is set but no oracle was loaded; "
+                       "anticipation stays off\n", __func__);
+        spec_ahead = 0;
+    }
+
     debug         = std::getenv("LLAMA_MOE_STREAM_DEBUG") != nullptr;
     use_direct_io = direct;
 
@@ -386,8 +404,11 @@ llama_moe_stream::~llama_moe_stream() {
         std::lock_guard<std::mutex> lock(mtx);
         shutting_down = true;
         q_demand.clear();
+        q_spec.clear();
     }
     cv_work.notify_all();
+    save_trace();
+
     for (auto & w : workers) {
         w.join();
     }
@@ -598,15 +619,56 @@ void llama_moe_stream::worker_loop(int worker_id) {
 
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
-        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty(); });
+        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() || !q_spec.empty(); });
         if (shutting_down) {
             break;
         }
 
-        llama_moe_stream_work w = q_demand.front();
-        q_demand.pop_front();
+        // Demand always first. A speculative item is only ever taken when there is nothing the
+        // graph is waiting on, which is what makes speculation unable to cost anything.
+        const bool from_spec = q_demand.empty();
+        llama_moe_stream_work w = from_spec ? q_spec.front() : q_demand.front();
+        if (from_spec) {
+            q_spec.pop_front();
+        } else {
+            q_demand.pop_front();
+        }
 
         auto & sl = *w.sl;
+
+        if (w.spec) {
+            // Host tier only: read the slab into an L2 slot and stop there. No cache slot is
+            // reserved, nothing is uploaded, and no generation can go stale -- so the worst a
+            // wrong guess costs is the read itself.
+            if (!l2) {
+                continue;
+            }
+            const auto & wt = sl.weights[w.weight];
+            const size_t offs = wt.offs + (size_t) w.expert*wt.nb_expert;
+            lk.unlock();
+            size_t slot_hit = SIZE_MAX;
+            const uint8_t * have = l2->find(wt.file_idx, offs, wt.nb_expert, &slot_hit);
+            if (have != nullptr) {
+                l2->release(slot_hit);          // already there: nothing to do
+            } else {
+                size_t    slot_l2 = 0;
+                uint8_t * dst = l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2);
+                if (dst != nullptr) {
+                    const uint8_t * data = llama_moe_stream_pread(*files[wt.file_idx], dst,
+                            wt.nb_expert, offs, use_direct_io, worker_id);
+                    if (data == nullptr) {
+                        // a failed speculative read is not an error: drop the slot and carry on
+                        l2->abandon(slot_l2);
+                    } else {
+                        l2->commit(slot_l2, (size_t) (data - dst));
+                        stats.n_spec_filled++;
+                    }
+                }
+                // dst == nullptr means every slot is in flight; the guess is simply dropped
+            }
+            lk.lock();
+            continue;
+        }
         const uint8_t bit = (w.weight >= 0 && w.weight < 8) ? (uint8_t) (1u << w.weight) : 0u;
         if (w.gen != sl.slot_gen[w.slot] ||
             sl.slot_state[w.slot] != LLAMA_MOE_STREAM_SLOT_LOADING ||
@@ -782,6 +844,122 @@ void llama_moe_stream::enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t 
     cv_work.notify_all();
 }
 
+// "<call> <layer> <e1,e2,...>" per line, in call order. Plain text on purpose: this file is
+// read by hand as often as by code, and a run that produced a different call count has to be
+// visible at a glance rather than decoded.
+void llama_moe_stream::load_oracle(const char * path) {
+    std::ifstream f(path);
+    if (!f) {
+        LLAMA_LOG_WARN("%s: moe stream: cannot read oracle %s\n", __func__, path);
+        return;
+    }
+    std::string linha;
+    while (std::getline(f, linha)) {
+        if (linha.empty()) {
+            continue;
+        }
+        std::istringstream is(linha);
+        int64_t call = 0;
+        int32_t il   = 0;
+        std::string lista;
+        if (!(is >> call >> il >> lista)) {
+            continue;
+        }
+        std::vector<int32_t> experts;
+        size_t pos = 0;
+        while (pos < lista.size()) {
+            size_t virgula = lista.find(',', pos);
+            if (virgula == std::string::npos) virgula = lista.size();
+            if (virgula > pos) {
+                experts.push_back(atoi(lista.substr(pos, virgula - pos).c_str()));
+            }
+            pos = virgula + 1;
+        }
+        if ((int64_t) spec_oracle.size() != call) {
+            LLAMA_LOG_WARN("%s: moe stream: oracle line %" PRId64 " is out of order; stopping there\n",
+                    __func__, call);
+            break;
+        }
+        spec_oracle.emplace_back(il, std::move(experts));
+    }
+    LLAMA_LOG_INFO("%s: moe stream: oracle loaded, %zu calls\n", __func__, spec_oracle.size());
+}
+
+void llama_moe_stream::save_trace() const {
+    if (spec_trace_path.empty() || spec_trace.empty()) {
+        return;
+    }
+    std::ofstream f(spec_trace_path);
+    if (!f) {
+        LLAMA_LOG_WARN("%s: moe stream: cannot write trace %s\n", __func__, spec_trace_path.c_str());
+        return;
+    }
+    for (size_t i = 0; i < spec_trace.size(); i++) {
+        f << i << ' ' << spec_trace[i].first << ' ';
+        for (size_t j = 0; j < spec_trace[i].second.size(); j++) {
+            if (j) f << ',';
+            f << spec_trace[i].second[j];
+        }
+        f << '\n';
+    }
+    LLAMA_LOG_INFO("%s: moe stream: trace written, %zu calls -> %s\n",
+            __func__, spec_trace.size(), spec_trace_path.c_str());
+}
+
+// A4. The index is this manager's OWN call counter, so a run that issues the same calls in the
+// same order replays exactly. Recording happens whatever the mode, because a trace is only worth
+// anything if it comes from a run that was not already being helped by one.
+void llama_moe_stream::trace_and_speculate_locked(llama_moe_stream_layer & sl) {
+    const int64_t idx = spec_calls++;
+
+    if (!spec_trace_path.empty()) {
+        spec_trace.resize((size_t) idx + 1);
+        spec_trace[(size_t) idx] = { sl.il, sl.uniq };
+    }
+    if (spec_ahead <= 0) {
+        return;
+    }
+    for (int32_t k = 1; k <= spec_ahead; k++) {
+        const size_t j = (size_t) (idx + k);
+        if (j >= spec_oracle.size()) {
+            break;
+        }
+        const int32_t il_futuro = spec_oracle[j].first;
+        if (il_futuro < 0 || (size_t) il_futuro >= layers.size() || !layers[il_futuro]) {
+            continue;
+        }
+        for (const int32_t e : spec_oracle[j].second) {
+            speculate_locked(*layers[il_futuro], e);
+        }
+    }
+}
+
+// Queue a host-tier fill for an expert this layer has NOT been asked for yet. Bounded, because
+// a speculative queue longer than the drive can drain is a queue of guesses about the past.
+void llama_moe_stream::speculate_locked(llama_moe_stream_layer & sl, int32_t expert) {
+    if (!l2 || expert < 0 || (uint32_t) expert >= sl.n_expert) {
+        return;
+    }
+    if (q_spec.size() >= spec_queue_max) {
+        return;
+    }
+    // already in the cache: the graph will not have to read it at all
+    if (sl.expert_slot.find(expert) != sl.expert_slot.end()) {
+        return;
+    }
+    const int32_t n = (int32_t) sl.weights.size();
+    for (int32_t w = 0; w < n; w++) {
+        llama_moe_stream_work it;
+        it.sl     = &sl;
+        it.expert = expert;
+        it.weight = w;
+        it.spec   = true;
+        q_spec.push_back(it);
+    }
+    stats.n_spec_queued++;
+    cv_work.notify_all();
+}
+
 size_t llama_moe_stream::size_bufs() const {
     size_t size = 0;
     for (const auto & buf : bufs) {
@@ -865,6 +1043,12 @@ void llama_moe_stream::print_stats(const char * role) const {
     LLAMA_LOG_WARN("%s: %smoe stream: remap calls = %" PRId64 ", expert hits = %" PRId64 ", misses = %" PRId64 " (%" PRId64 " cold), hit rate = %.2f%%\n",
             __func__, pfx, stats.n_calls, stats.n_hit, stats.n_miss, stats.n_miss_cold,
             n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
+    if (stats.n_spec_queued > 0) {
+        LLAMA_LOG_WARN("%s: %smoe stream: anticipated %" PRId64 " experts, %" PRId64 " read into the host tier "
+                "(%.1f%% of the guesses were already there or dropped)\n",
+                __func__, pfx, stats.n_spec_queued, stats.n_spec_filled,
+                stats.n_spec_queued > 0 ? 100.0*(stats.n_spec_queued - stats.n_spec_filled)/stats.n_spec_queued : 0.0);
+    }
     if (stats.n_hit_pin > 0) {
         LLAMA_LOG_WARN("%s: %smoe stream: JigSaw pinned hits = %" PRId64 " (%.2f%% dos hits)\n",
                 __func__, pfx, stats.n_hit_pin,
@@ -1071,6 +1255,8 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
                 sl->il, sl->uniq.size(), sl->n_slots);
     }
 
+    mgr->trace_and_speculate_locked(*sl);
+
     // route hotness for eviction; halved periodically so a formerly-hot expert ages out
     for (const int32_t e : sl->uniq) {
         sat_inc(sl->route_hotness[e]);
@@ -1189,6 +1375,8 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
             sl.uniq.push_back(e);
         }
     }
+
+    trace_and_speculate_locked(sl);
 
     GGML_ASSERT(sl.plan_capacity > 0);
     sl.expert_wave.assign(sl.n_expert, 0xff);

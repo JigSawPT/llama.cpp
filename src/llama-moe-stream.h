@@ -152,6 +152,12 @@ struct llama_moe_stream_work {
     int32_t  slot   = -1;
     uint64_t gen    = 0; // stale unless it matches slot_gen[slot]
     int32_t  weight = -1; // index into sl->weights; -1 means "every tensor" (legacy/whole expert)
+
+    // Speculative work fills the HOST tier only: no cache slot, no upload, no generation to
+    // go stale. It exists because the graph cannot issue more than one layer of demand at a
+    // time -- the router of layer L needs the output of L-1 -- so the drive never sees a queue
+    // deeper than ~4 and gives 4,33 GB/s of the 10,04 it reaches at depth 6.
+    bool     spec   = false;
 };
 
 // The smallest expert cache the multi-pass path can work with.
@@ -364,6 +370,23 @@ struct llama_moe_stream {
     size_t  max_nb_expert      = 0;
     int64_t hot_decay_interval = 0; // remap calls between route-hotness halvings (0 = no decay)
 
+    // A4, prefetch. How many remap calls ahead the oracle looks, and the ceiling on the
+    // speculative queue. ahead = 0 turns the whole thing off, which is the default: this path
+    // is opt-in because it changes what the drive is asked for and nothing else should inherit
+    // that by accident.
+    int32_t spec_ahead     = 0;
+    size_t  spec_queue_max = 512;
+    // Own counter, not stats.n_calls: that one is bumped from two places (the remap and the
+    // multi-pass planner) and only one of them can be the trace index without leaving holes
+    // the size of the prefill.
+    int64_t spec_calls     = 0;
+    // One entry per remap call, in call order: the layer it ran on and the experts it touched.
+    // The index IS the call number, so replay needs no notion of token boundary -- two runs of
+    // the same prompt issue the same calls in the same order.
+    std::vector<std::pair<int32_t, std::vector<int32_t>>> spec_oracle;
+    std::vector<std::pair<int32_t, std::vector<int32_t>>> spec_trace;   // being recorded
+    std::string                                           spec_trace_path;
+
     std::vector<std::pair<ggml_backend_buffer_type_t, ggml_context_ptr>> ctxs; // one per buft
     std::vector<ggml_backend_buffer_ptr> bufs;
 
@@ -391,6 +414,10 @@ struct llama_moe_stream {
 
     std::deque<llama_moe_stream_work> q_demand;
 
+    // Drained only when q_demand is empty, so speculation can never delay a load the graph is
+    // waiting on. Bounded: a queue that grows faster than it drains is prefetching the past.
+    std::deque<llama_moe_stream_work> q_spec;
+
     std::vector<std::thread> workers;
     bool workers_started = false;
     bool shutting_down   = false;
@@ -404,6 +431,8 @@ struct llama_moe_stream {
         int64_t n_hit_pin   = 0; // JigSaw: hits servidos por slots pinados
         int64_t n_miss      = 0; // demand loads issued
         int64_t n_miss_cold = 0; // first-ever touch of an expert
+        int64_t n_spec_queued = 0; // experts guessed ahead (A4)
+        int64_t n_spec_filled = 0; // of those, actually read into the host tier
         int64_t t_stall_us  = 0; // wait time in miss handling, from the point every miss is issued
 
         // wait for a free slot, which t_stall_us cannot see: it starts only once all demand loads
@@ -431,6 +460,15 @@ struct llama_moe_stream {
     // queues one read per weight tensor and wakes the pool; see the .cpp for why
     // the split is what raises queue depth on a single stream
     void enqueue_slot_locked(llama_moe_stream_layer & sl, int32_t expert, int32_t slot);
+
+    // queue a host-tier-only fill for an expert not yet asked for
+    void speculate_locked(llama_moe_stream_layer & sl, int32_t expert);
+
+    void load_oracle(const char * path);
+    void save_trace() const;
+
+    // record this call and, if an oracle is loaded, queue the next spec_ahead calls
+    void trace_and_speculate_locked(llama_moe_stream_layer & sl);
 
     // multi-pass prefill helpers (called by llama_moe_stream_wave_ids, all under mtx)
     void plan_waves_locked(llama_moe_stream_layer & sl, const int32_t * ids, int64_t n); // wave 0: build the plan
