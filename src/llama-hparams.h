@@ -268,6 +268,9 @@ struct llama_hparams {
     std::array<uint32_t, LLAMA_MAX_LAYERS> engram_num_embd  = {};
     float    dsv4_compress_rope_base   = 0.0f;
     float    dsv4_hc_eps               = 0.0f;
+    // V4.1 semantics: no per-head q norm, hc mix threaded one sublayer ahead, final collapse
+    // with the last ffn mix. Set from the arch for the main model, from a KV for a DFLASH draft.
+    bool     dsv4_v41                  = false;
     std::array<uint32_t, LLAMA_MAX_LAYERS> dsv4_compress_ratios;
 
     // qwen3vl deepstack

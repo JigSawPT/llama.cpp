@@ -54,6 +54,7 @@ static ggml_tensor * dsv4_engram(
 }
 
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
+    hparams.dsv4_v41 = arch == LLM_ARCH_DEEPSEEK41;
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     if (hparams.n_layer_nextn > 0 && hparams.n_layer_nextn < hparams.n_layer_all) {
         const uint32_t n_layer_main = hparams.n_layer_all - hparams.n_layer_nextn;
@@ -1282,7 +1283,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     ggml_tensor * q = build_lora_mm(layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, nt);
-    if (arch != LLM_ARCH_DEEPSEEK41) {
+    if (!hparams.dsv4_v41) {
         // V4 normalises each head of q after wq_b; V4.1 does not, and doing it anyway pins
         // every head to RMS 1, which is where its attention output lost a fifth of its norm
         q = ggml_rms_norm(ctx0, q, norm_rms_eps);
@@ -1701,7 +1702,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     // V4.1 threads the hyper-connection mix one sublayer ahead; V4 collapses in place and
     // passes nullptr, which leaves its graph unchanged.
     ggml_tensor *  hc_carry_v = nullptr;
-    ggml_tensor ** hc_carry   = arch == LLM_ARCH_DEEPSEEK41 ? &hc_carry_v : nullptr;
+    ggml_tensor ** hc_carry   = hparams.dsv4_v41 ? &hc_carry_v : nullptr;
 
     // the compressed positions the last index source picked, reused by the layers after it
     ggml_tensor * topk_carry_v = nullptr;
@@ -1870,7 +1871,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
     // V4.1 threads the hyper-connection mix one sublayer ahead; V4 collapses in place and
     // passes nullptr, which leaves its graph unchanged.
     ggml_tensor *  hc_carry_v = nullptr;
-    ggml_tensor ** hc_carry   = arch == LLM_ARCH_DEEPSEEK41 ? &hc_carry_v : nullptr;
+    ggml_tensor ** hc_carry   = hparams.dsv4_v41 ? &hc_carry_v : nullptr;
 
     const int64_t hc = hparams.dsv4_hc_mult;
     GGML_ASSERT(hparams.n_embd_out() == (uint32_t) (n_embd*hc) && "DEEPSEEK4 MTP hidden width mismatch");

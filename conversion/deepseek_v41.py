@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Iterable
 
 import numpy as np
@@ -30,7 +31,7 @@ class DeepseekV41Model(DeepseekV4Model):
 
     # The V4.1 MTP block is not the V4 one: it has main_proj/main_norm/markov_head/confidence_head
     # and none of the nextn.e_proj/h_proj/enorm/hnorm that generate_extra_tensors looks for.
-    # Refusing --mtp is honest; mapping those five names is a separate piece of work.
+    # --mtp stays refused; the block is a DSpark draft and exports with --dspark (see below).
     supports_mtp_export = False
 
     def __init__(self, *args, **kwargs):
@@ -276,3 +277,89 @@ class DeepseekV41Model(DeepseekV4Model):
                 return [(out, data_torch.view(torch.uint8))]
             return [(out, data_torch)]
         return super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("DeepseekV41DSparkModel")
+class DeepseekV41DSparkModel(DeepseekV41Model):
+    """The V4.1 DSpark draft: three full V4.1 blocks under mtp.*, exported as a DFLASH model.
+    Same layout as DeepseekV4DSparkModel with the V4.1 names for the heads. The block has no
+    hc_head weights (V4.1 collapses with the mix the last ffn produced) and no per-head q norm;
+    dsv41_semantics tells the C++ side to run it like the main V4.1 model.
+    Like every DSpark stage, only the first stage has main_proj/main_norm and only the last has
+    norm/markov_head/confidence_head; the reference (DSparkBlock.__init__) builds them that way.
+    """
+    model_arch = gguf.MODEL_ARCH.DFLASH
+
+    _DSPARK_ROOT_MAP: dict[str, tuple[gguf.MODEL_TENSOR, str]] = {
+        "main_proj.weight":            (gguf.MODEL_TENSOR.FC,               ".weight"),
+        "main_norm.weight":            (gguf.MODEL_TENSOR.ENC_OUTPUT_NORM,  ".weight"),
+        "markov_head.embed.weight":    (gguf.MODEL_TENSOR.DSPARK_MARKOV_W1, ".weight"),
+        "markov_head.head.weight":     (gguf.MODEL_TENSOR.DSPARK_MARKOV_W2, ".weight"),
+        "confidence_head.proj.weight": (gguf.MODEL_TENSOR.DSPARK_CONF_PROJ, ".weight"),
+    }
+    # main_proj.scale pairs with main_proj.weight in dequant_model; norm.weight is the decoder
+    # final norm, mapped by the V4 root rule
+    _DSPARK_ROOT_NAMES = ("main_proj.scale", "norm.weight")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.block_count = 1 + max(
+            int(match.group(1)) for name in self.model_tensors
+            if (match := re.match(r"layers\.(\d+)\.", name))
+        )
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+        h = self.hparams
+        h["compress_ratios"] = [0] * self.block_count
+        # the draft routes over its own, smaller pool (128 experts, 3 used); the MXFP4 writer
+        # and expert_count read these two keys
+        h["n_routed_experts"] = h["dspark_n_routed_experts"]
+        h["num_experts_per_tok"] = h["dspark_num_experts_per_tok"]
+        # no engram in the draft: prepare_tensors streams the tables of these layers
+        self._engram_layer_ids = []
+        self._engram_num_embeddings = []
+
+    @classmethod
+    def filter_tensors(cls, item):
+        name, gen = item
+        if not name.startswith("mtp."):
+            return None
+        return super().filter_tensors((cls._rekey_mtp_tensor_name(name), gen))
+
+    @classmethod
+    def _rekey_mtp_tensor_name(cls, name: str) -> str:
+        match = re.match(r"mtp\.(\d+)\.(.+)$", name)
+        if match is None:
+            raise ValueError(f"Unexpected DSpark tensor {name!r}")
+        stage, rest = match.group(1), match.group(2)
+        if rest in cls._DSPARK_ROOT_MAP or rest in cls._DSPARK_ROOT_NAMES:
+            return rest
+        return f"layers.{stage}.{rest}"
+
+    def _map_dsv4_tensor_name(self, name: str, bid: int | None):
+        if name in self._DSPARK_ROOT_MAP:
+            return self._DSPARK_ROOT_MAP[name]
+        return super()._map_dsv4_tensor_name(name, bid)
+
+    def set_vocab(self):
+        if self.target_model_dir is None:
+            raise ValueError("DeepSeek-V4.1 DSpark requires --target-model-dir with the target tokenizer")
+        original_dir = self.dir_model
+        try:
+            self.dir_model = self.target_model_dir
+            super().set_vocab()
+        finally:
+            self.dir_model = original_dir
+        self.gguf_writer.add_mask_token_id(self.hparams["dspark_noise_token_id"])
+
+    def set_gguf_parameters(self):
+        # the V4 keys only: the V4.1 additions (engram, indexer sources) describe the target
+        DeepseekV4Model.set_gguf_parameters(self)
+        h = self.hparams
+        self.gguf_writer.add_block_size(h["dspark_block_size"])
+        # the reference takes h.mean(dim=2) BEFORE running a target layer (Transformer.forward),
+        # and t_layer_inp[il] in deepseek4.cpp is the input of layer il: the ids go through as
+        # they are. V4 takes the mean after the layer, which is why its exporter adds one.
+        self.gguf_writer.add_target_layers([int(v) for v in h["dspark_target_layer_ids"]])
+        self.gguf_writer.add_bool(f"{gguf.MODEL_ARCH_NAMES[self.model_arch]}.dsv41_semantics", True)

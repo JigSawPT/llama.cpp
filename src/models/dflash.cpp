@@ -23,6 +23,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     // DeepSeek-V4 DSpark backbone: stages are full DSV4 blocks, uniform sliding window (the draft KV ring)
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false);
     if (hparams.dsv4_hc_mult > 0) {
+        ml.get_key(LLM_KV_DSV41_SEMANTICS, hparams.dsv4_v41, false);
         ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,                hparams.n_lora_q);
         ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,             hparams.n_swa);
         ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,           hparams.n_ff_exp);
@@ -111,9 +112,12 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         const int64_t hc_dim          = hc_mult * n_embd;
         const int64_t hc_mix_dim      = (2 + hc_mult) * hc_mult;
 
-        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult}, 0);
-        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult}, 0);
-        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, 0);
+        // V4.1 has no hc_head weights: the final collapse reuses the last ffn mix
+        const int hc_head_opt = hparams.dsv4_v41 ? TENSOR_NOT_REQUIRED : 0;
+
+        hc_head_fn    = create_tensor(tn(LLM_TENSOR_HC_HEAD_FN,    "weight"), {hc_dim, hc_mult}, hc_head_opt);
+        hc_head_base  = create_tensor(tn(LLM_TENSOR_HC_HEAD_BASE,  "weight"), {hc_mult}, hc_head_opt);
+        hc_head_scale = create_tensor(tn(LLM_TENSOR_HC_HEAD_SCALE, "weight"), {1}, hc_head_opt);
 
         for (int i = 0; i < n_layer; ++i) {
             auto & layer = layers[i];
@@ -585,6 +589,10 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
     inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
     cb(inpL, "hc_init", -1);
 
+    // V4.1 threads the hyper-connection mix one sublayer ahead (see deepseek4.cpp)
+    ggml_tensor *  hc_carry_v = nullptr;
+    ggml_tensor ** hc_carry   = hparams.dsv4_v41 ? &hc_carry_v : nullptr;
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
 
@@ -596,7 +604,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
                 layer.hc_attn_fn,
                 layer.hc_attn_scale,
                 layer.hc_attn_base,
-                &post, &comb, il);
+                &post, &comb, il, hc_carry);
         cb(cur, "hc_attn_pre", il);
 
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -612,7 +620,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
                 layer.hc_ffn_fn,
                 layer.hc_ffn_scale,
                 layer.hc_ffn_base,
-                &post, &comb, il);
+                &post, &comb, il, hc_carry);
         cb(cur, "hc_ffn_pre", il);
 
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
@@ -645,7 +653,15 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         cb(inpL, "l_out", il);
     }
 
-    ggml_tensor * cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    // V4.1 collapses with the mix the last ffn produced (DSparkBlock.forward_head:
+    // hc_pre(x, pre_mix)); V4 has dedicated head weights
+    ggml_tensor * cur = nullptr;
+    if (hc_carry != nullptr) {
+        GGML_ASSERT(hc_carry_v && "DSpark V4.1: no mix carried to the final collapse");
+        cur = build_hc_pre(inpL, hc_carry_v, -1);
+    } else {
+        cur = build_hc_head(inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    }
     cb(cur, "hc_head", -1);
 
     // confidence head input: the reference scores the pre-norm collapsed hidden state
