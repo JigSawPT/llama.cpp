@@ -44,12 +44,35 @@ static bool dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     const int64_t n = ggml_nelements(t);
-    std::vector<char> bruto((size_t) ggml_nbytes(t));
-    ggml_backend_tensor_get(t, bruto.data(), 0, bruto.size());
+    // A view is not contiguous: ggml_argsort_top_k hands back ne[0] = 6 over rows of
+    // nb[1] = n_expert * 4, so a linear read of nbytes returns the wrong values with the
+    // right shape -- which reads as a defect in the model rather than in the probe. Copy
+    // row by row and let the stride say where each row starts.
+    const size_t linha = ggml_row_size(t->type, t->ne[0]);
+    std::vector<char> bruto(linha * (size_t) (t->ne[1]*t->ne[2]*t->ne[3]));
+    {
+        size_t dst = 0;
+        for (int64_t i3 = 0; i3 < t->ne[3]; i3++) {
+            for (int64_t i2 = 0; i2 < t->ne[2]; i2++) {
+                for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
+                    const size_t off = i3*t->nb[3] + i2*t->nb[2] + i1*t->nb[1];
+                    ggml_backend_tensor_get(t, bruto.data() + dst, off, linha);
+                    dst += linha;
+                }
+            }
+        }
+    }
 
     std::vector<float> vals((size_t) n);
     if (t->type == GGML_TYPE_F32) {
         memcpy(vals.data(), bruto.data(), (size_t) n * sizeof(float));
+    } else if (t->type == GGML_TYPE_I32) {
+        // expert ids and other index tensors: the traits have no to_float, and widening
+        // them is exact for anything an index can hold
+        const int32_t * src = (const int32_t *) bruto.data();
+        for (int64_t i = 0; i < n; i++) {
+            vals[(size_t) i] = (float) src[i];
+        }
     } else {
         const auto * tr = ggml_get_type_traits(t->type);
         if (!tr->to_float) {
