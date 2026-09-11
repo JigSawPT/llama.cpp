@@ -299,6 +299,11 @@ struct llama_moe_stream_l2 {
     // emitted 8,191 characters of "<<<<<<<<" instead of an answer. Nothing about that failure is
     // visible in a throughput number - it looks like a fast run.
     const uint8_t * find(uint16_t file_idx, size_t offs, size_t len, size_t * out_slot);
+    // Is this slab resident? Unlike find(), this counts nothing and marks nothing: a
+    // speculative probe that bumped n_hit would inflate the tier's own hit rate, and one
+    // that set the reference bit would protect a slab from eviction on the strength of a
+    // guess. Both corrupt the measurement this path exists to produce.
+    bool has(uint16_t file_idx, size_t offs, size_t len);
     void            release(size_t slot);
 
     // A slot to read INTO, marked LOADING, or nullptr when the tier is off, already owns this
@@ -380,6 +385,12 @@ struct llama_moe_stream {
     // multi-pass planner) and only one of them can be the trace index without leaving holes
     // the size of the prefill.
     int64_t spec_calls     = 0;
+    // Highest call index already queued. Without it, call c queues c+1..c+k and call c+1 queues
+    // c+2..c+k+1, so every future call is queued k times over -- which is what put 487 000
+    // entries through the queue at ahead=120 and made the sweep measure duplication, not depth.
+    int64_t spec_frontier  = -1;
+    // workers with id below this never take speculative work, so demand always has a pool
+    int32_t n_spec_workers_from = 0;
     // One entry per remap call, in call order: the layer it ran on and the experts it touched.
     // The index IS the call number, so replay needs no notion of token boundary -- two runs of
     // the same prompt issue the same calls in the same order.

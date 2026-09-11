@@ -246,6 +246,23 @@ uint8_t * llama_moe_stream_l2::reserve(uint16_t file_idx, size_t offs, size_t le
     return nullptr; // every slot is in flight
 }
 
+bool llama_moe_stream_l2::has(uint16_t file_idx, size_t offs, size_t len) {
+    if (base == nullptr) {
+        return false;
+    }
+    const uint64_t key = make_key(file_idx, offs);
+
+    L2_LOCK(*this);
+    auto it = index.find(key);
+    if (it == index.end()) {
+        return false;
+    }
+    const entry & e = entries[it->second];
+    // Same RESIDENT-and-same-length test as find(), and deliberately nothing else: no pin, no
+    // reference bit, no n_hit. A guess must not grade itself.
+    return e.st == RESIDENT && e.len == len;
+}
+
 void llama_moe_stream_l2::commit(size_t slot, size_t head) {
     L2_LOCK(*this);
     entry & e = entries[slot];
@@ -603,6 +620,16 @@ void llama_moe_stream::start_workers_locked() {
         return;
     }
     workers_started = true;
+    // Half the pool, at least two, never touches speculation. Two because one leaves no
+    // parallelism at all for demand, and half because the point of speculating is to use
+    // capacity that demand is not using -- not to take capacity away from it.
+    // Half the pool, but NEVER all of it: max(2, n/2) with n <= 2 leaves no worker able to
+    // drain q_spec at all, so the queue fills to its bound and every later call pays the
+    // enqueue cost for guesses nobody will ever read.
+    n_spec_workers_from = std::min<int32_t>(n_io_threads - 1, std::max<int32_t>(1, n_io_threads / 2));
+    if (n_spec_workers_from < 0) {
+        n_spec_workers_from = 0;
+    }
     workers.reserve(n_io_threads);
     for (int32_t i = 0; i < n_io_threads; i++) {
         workers.emplace_back([this, i]() { worker_loop((int) i); });
@@ -619,14 +646,16 @@ void llama_moe_stream::worker_loop(int worker_id) {
 
     std::unique_lock<std::mutex> lk(mtx);
     while (true) {
-        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() || !q_spec.empty(); });
+        cv_work.wait(lk, [&]{ return shutting_down || !q_demand.empty() ||
+                (!q_spec.empty() && worker_id >= n_spec_workers_from); });
         if (shutting_down) {
             break;
         }
 
-        // Demand always first. A speculative item is only ever taken when there is nothing the
-        // graph is waiting on, which is what makes speculation unable to cost anything.
-        const bool from_spec = q_demand.empty();
+        // Demand always first -- but that is only half of it. A worker already executing a
+        // speculative read cannot be preempted, so with every worker speculating a demand item
+        // still waits for a whole 5,98 MiB read. Some workers therefore never speculate at all.
+        const bool from_spec = q_demand.empty() && worker_id >= n_spec_workers_from;
         llama_moe_stream_work w = from_spec ? q_spec.front() : q_demand.front();
         if (from_spec) {
             q_spec.pop_front();
@@ -645,11 +674,12 @@ void llama_moe_stream::worker_loop(int worker_id) {
             }
             const auto & wt = sl.weights[w.weight];
             const size_t offs = wt.offs + (size_t) w.expert*wt.nb_expert;
+            bool encheu = false;
             lk.unlock();
-            size_t slot_hit = SIZE_MAX;
-            const uint8_t * have = l2->find(wt.file_idx, offs, wt.nb_expert, &slot_hit);
-            if (have != nullptr) {
-                l2->release(slot_hit);          // already there: nothing to do
+            // has(), not find(): a guess must not count as a hit of the tier nor mark the slab
+            // as recently used. find() does both, and both would be the guess grading itself.
+            if (l2->has(wt.file_idx, offs, wt.nb_expert)) {
+                // already there: nothing to do
             } else {
                 size_t    slot_l2 = 0;
                 uint8_t * dst = l2->reserve(wt.file_idx, offs, wt.nb_expert, &slot_l2);
@@ -661,12 +691,18 @@ void llama_moe_stream::worker_loop(int worker_id) {
                         l2->abandon(slot_l2);
                     } else {
                         l2->commit(slot_l2, (size_t) (data - dst));
-                        stats.n_spec_filled++;
+                        encheu = true;   // counted under the lock below, not here
                     }
                 }
                 // dst == nullptr means every slot is in flight; the guess is simply dropped
             }
             lk.lock();
+            // Under the lock, like every other write to stats in this file. Left outside it,
+            // two speculating workers lose each other's increments and print_stats reads a
+            // torn value -- and that counter is the entire output of this apparatus.
+            if (encheu) {
+                stats.n_spec_filled++;
+            }
             continue;
         }
         const uint8_t bit = (w.weight >= 0 && w.weight < 8) ? (uint8_t) (1u << w.weight) : 0u;
@@ -919,8 +955,11 @@ void llama_moe_stream::trace_and_speculate_locked(llama_moe_stream_layer & sl) {
     if (spec_ahead <= 0) {
         return;
     }
-    for (int32_t k = 1; k <= spec_ahead; k++) {
-        const size_t j = (size_t) (idx + k);
+    // Start past what is already queued, not past the current call: otherwise every future
+    // call is queued once per lookahead step.
+    const int64_t inicio = std::max<int64_t>(idx + 1, spec_frontier + 1);
+    for (int64_t j0 = inicio; j0 <= idx + spec_ahead; j0++) {
+        const size_t j = (size_t) j0;
         if (j >= spec_oracle.size()) {
             break;
         }
@@ -931,6 +970,7 @@ void llama_moe_stream::trace_and_speculate_locked(llama_moe_stream_layer & sl) {
         for (const int32_t e : spec_oracle[j].second) {
             speculate_locked(*layers[il_futuro], e);
         }
+        spec_frontier = j0;
     }
 }
 
@@ -956,7 +996,12 @@ void llama_moe_stream::speculate_locked(llama_moe_stream_layer & sl, int32_t exp
         it.spec   = true;
         q_spec.push_back(it);
     }
-    stats.n_spec_queued++;
+    // Counted in TENSORS, like n_spec_filled: one queues experts and the other counts slabs
+    // made the printed percentage mix units, and it could go negative.
+    stats.n_spec_queued += n;
+    // notify_all is what the demand path needs; here it also wakes the reserved workers, which
+    // re-check the predicate and go back to sleep. Harmless but not free, and there is no
+    // notify_some -- documented rather than papered over.
     cv_work.notify_all();
 }
 
@@ -1044,8 +1089,8 @@ void llama_moe_stream::print_stats(const char * role) const {
             __func__, pfx, stats.n_calls, stats.n_hit, stats.n_miss, stats.n_miss_cold,
             n_touched > 0 ? 100.0*stats.n_hit/n_touched : 0.0);
     if (stats.n_spec_queued > 0) {
-        LLAMA_LOG_WARN("%s: %smoe stream: anticipated %" PRId64 " experts, %" PRId64 " read into the host tier "
-                "(%.1f%% of the guesses were already there or dropped)\n",
+        LLAMA_LOG_WARN("%s: %smoe stream: anticipated %" PRId64 " slabs, %" PRId64 " read into the host tier "
+                "(%.1f%% were already resident or dropped)\n",
                 __func__, pfx, stats.n_spec_queued, stats.n_spec_filled,
                 stats.n_spec_queued > 0 ? 100.0*(stats.n_spec_queued - stats.n_spec_filled)/stats.n_spec_queued : 0.0);
     }
@@ -1255,8 +1300,6 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
                 sl->il, sl->uniq.size(), sl->n_slots);
     }
 
-    mgr->trace_and_speculate_locked(*sl);
-
     // route hotness for eviction; halved periodically so a formerly-hot expert ages out
     for (const int32_t e : sl->uniq) {
         sat_inc(sl->route_hotness[e]);
@@ -1320,6 +1363,11 @@ void llama_moe_stream_remap(ggml_tensor * dst, const ggml_tensor * a, int ith, i
         }
     }
 
+    // Only now, with every demand load queued, is it safe to spend time on guesses: this
+    // runs under the lock the workers take to pick work up, so anything done here before
+    // the demand is enqueued delays the very loads the graph is about to wait on.
+    mgr->trace_and_speculate_locked(*sl);
+
     if (waited) {
         const int64_t t0 = ggml_time_us();
         mgr->cv_done.wait(lk, [&]{
@@ -1376,7 +1424,6 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
         }
     }
 
-    trace_and_speculate_locked(sl);
 
     GGML_ASSERT(sl.plan_capacity > 0);
     sl.expert_wave.assign(sl.n_expert, 0xff);
@@ -1386,6 +1433,10 @@ void llama_moe_stream::plan_waves_locked(llama_moe_stream_layer & sl, const int3
     }
     sl.plan_n_waves   = (uint32_t) ((sl.uniq.size() + sl.plan_capacity - 1)/sl.plan_capacity);
     sl.plan_next_wave = 0;
+
+    // After the wave's demand is planned, for the same reason as in the remap: this runs
+    // under the lock the workers take to pick work up.
+    trace_and_speculate_locked(sl);
 }
 
 // make wave w's expert slice (uniq[w*cap .. +count)) resident, waiting for its loads, and best-effort
