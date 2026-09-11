@@ -571,6 +571,7 @@ public:
         ggml_tensor * state_snapshot_dst_idxs = nullptr; // I32 [n_state_snapshot]
         ggml_tensor * state_read_idxs  = nullptr; // I32 [ratio*n_state_write]
         ggml_tensor * state_write_idxs = nullptr; // I64 [n_state_write]
+        ggml_tensor * state_write_idxs_lid = nullptr; // I64 [n_state_write], index cache stride
         ggml_tensor * state_write_pos  = nullptr; // I32 [n_state_write]
 
         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]

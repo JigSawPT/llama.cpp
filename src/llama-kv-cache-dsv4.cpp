@@ -456,7 +456,8 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         uint32_t kv_size,
         uint32_t n_stream,
         uint32_t n_rs_seq,
-        const std::vector<uint32_t> & rs_idx) {
+        const std::vector<uint32_t> & rs_idx,
+        uint32_t kv_size_lid) {
     llama_kv_cache_dsv4_context::comp_plan plan;
     plan.n_visible.resize(ubatch.n_tokens);
     plan.n_stream = dsv4_comp_graph_n_stream(ubatch, n_stream);
@@ -548,6 +549,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
             const int64_t cache_off = dsv4_stream_offset(n_stream, seq_id, kv_size);
 
             plan.state_write_idxs.push_back(cache_off + pos/ratio);
+            if (kv_size_lid > 0) {
+                plan.state_write_idxs_lid.push_back(
+                        dsv4_stream_offset(n_stream, seq_id, kv_size_lid) + pos/ratio);
+            }
             plan.state_write_pos.push_back((int32_t) source_start);
             ++state_write_counts[seq_id];
 
@@ -580,6 +585,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
             const int32_t source_idx = state_source_idx(seq_id, ubatch.pos[i]);
 
             plan.state_write_idxs.push_back(cache_off + kv_size - 1);
+            if (kv_size_lid > 0) {
+                plan.state_write_idxs_lid.push_back(
+                        dsv4_stream_offset(n_stream, seq_id, kv_size_lid) + kv_size_lid - 1);
+            }
             plan.state_write_pos .push_back(0);
 
             if (overlap) {
@@ -727,12 +736,13 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
         uint32_t kv_size,
         uint32_t n_stream,
         uint32_t n_rs_seq,
-        const std::vector<uint32_t> & rs_idx) {
+        const std::vector<uint32_t> & rs_idx,
+        uint32_t kv_size_lid) {
     std::vector<llama_kv_cache_dsv4_context::comp_plan> plans;
     plans.reserve(ubatches.size());
 
     for (const llama_ubatch & ubatch : ubatches) {
-        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs_idx));
+        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs_idx, kv_size_lid));
     }
 
     return plans;
@@ -849,6 +859,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
     plan.state_snapshot_src_idxs.resize(n_snapshot);
     plan.state_snapshot_dst_idxs.resize(n_snapshot);
     plan.state_read_idxs .resize((overlap ? 2u : 1u)*ratio*n_blocks);
+    plan.state_write_idxs_lid.resize(plan.state_write_idxs.size());
     plan.state_write_idxs.resize(n_blocks);
     plan.state_write_pos .resize(n_blocks);
 
@@ -1206,6 +1217,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     csa_ratio(dsv4_comp_ratios(model).first),
     hca_ratio(dsv4_comp_ratios(model).second),
     comp_overlap(model.arch != LLM_ARCH_DEEPSEEK41),
+    lid_ratio(std::min(dsv4_comp_ratios(model).first, dsv4_comp_ratios(model).second)),
     rs_idx(n_seq_max, 0) {
 
     if (model.hparams.engram_n_layer > 0) {
@@ -1299,8 +1311,6 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     // the index keys sit one per compressed position, so the cache has to fit the finest
     // ratio any source layer compresses at. V4 has a single indexer ratio and is unaffected.
-    const uint32_t lid_ratio = csa_ratio < hca_ratio ? csa_ratio : hca_ratio;
-
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, lid_ratio));
 
@@ -1486,6 +1496,8 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return false;
         }
 
+        engram_hist_clear(seq_id, p0);
+
         const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
         if (p0 > pos_max) {
             bool res = true;
@@ -1539,6 +1551,40 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     if (seq_id_src != seq_id_dst) {
         rs_idx[seq_id_dst] = 0;
     }
+
+    engram_hist_copy(seq_id_src, seq_id_dst);
+}
+
+// The n-gram history travels with the sequence. Without this the copy keeps the whole KV
+// but starts with an empty history, so every n-gram collapses onto the pad id and the first
+// tokens come out different from the sequence they were copied from.
+void llama_kv_cache_dsv4::engram_hist_copy(llama_seq_id seq_id_src, llama_seq_id seq_id_dst) {
+    if (engram_hist.empty() || seq_id_src == seq_id_dst) {
+        return;
+    }
+    if (seq_id_src < 0 || (uint32_t) seq_id_src >= n_seq_max ||
+        seq_id_dst < 0 || (uint32_t) seq_id_dst >= n_seq_max) {
+        return;
+    }
+
+    const size_t src = (size_t) seq_id_src*engram_hist_size;
+    const size_t dst = (size_t) seq_id_dst*engram_hist_size;
+    std::copy(engram_hist.begin() + src, engram_hist.begin() + src + engram_hist_size,
+              engram_hist.begin() + dst);
+}
+
+void llama_kv_cache_dsv4::engram_hist_clear(llama_seq_id seq_id, llama_pos p0) {
+    if (engram_hist.empty() || seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+        return;
+    }
+
+    const size_t base = (size_t) seq_id*engram_hist_size;
+    const size_t from = p0 > 0 ? (size_t) p0 : 0;
+    if (from >= engram_hist_size) {
+        return;
+    }
+    std::fill(engram_hist.begin() + base + from, engram_hist.begin() + base + engram_hist_size,
+              (int32_t) ENGRAM_NONE);
 }
 
 void llama_kv_cache_dsv4::seq_keep(llama_seq_id seq_id) {
@@ -1628,7 +1674,7 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
         const uint32_t n_rows_hca = seq_id >= 0 ?
             dsv4_state_n_used_k_rows(pos_max, hca_ratio, kv_hca->get_size()) : kv_hca->get_size();
         const uint32_t n_rows_lid = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, csa_ratio, kv_lid->get_size()) : kv_lid->get_size();
+            dsv4_state_n_used_k_rows(pos_max, lid_ratio, kv_lid->get_size()) : kv_lid->get_size();
 
         dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
         dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
@@ -2075,13 +2121,13 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     hca_ratio(kv->get_hca_ratio()),
     plans_csa(dsv4_build_comp_plans(this->ubatches, csa_ratio, kv->get_comp_overlap(),
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_n_rs_seq(), kv->get_rs_idx(), kv->get_lid()->get_size())),
     plans_hca(dsv4_build_comp_plans(this->ubatches, hca_ratio, false,
                 kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_n_rs_seq(), kv->get_rs_idx(), kv->get_lid()->get_size())),
     plans_lid(dsv4_build_comp_plans(this->ubatches, csa_ratio, kv->get_comp_overlap(),
                 kv->get_lid_state()->get_state_size(), kv->get_lid()->get_size(), kv->get_lid_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_n_rs_seq(), kv->get_rs_idx(), 0)),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
                 kv->get_raw(),
                 std::move(sinfos_raw_base_write),

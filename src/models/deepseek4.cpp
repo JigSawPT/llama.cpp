@@ -1398,9 +1398,10 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
         // V4.1 index keys come from the latent this compressor just produced
         if (layer.indexer_attn_k) {
+            // the index cache has its own per-stream stride, so it needs its own rows
             ggml_build_forward_expand(gf, build_v41_index_key(model, inp_dsv4, csa_latent,
                         inp_dsv4->get_csa().state_write_pos,
-                        inp_dsv4->get_csa().state_write_idxs, il));
+                        inp_dsv4->get_csa().state_write_idxs_lid, il));
         }
 
         ggml_tensor * csa_snapshot_source_kv = ggml_concat(ctx0,
@@ -1553,7 +1554,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         if (layer.indexer_attn_k) {
             ggml_build_forward_expand(gf, build_v41_index_key(model, inp_dsv4, hca_latent,
                         inp_dsv4->get_hca().state_write_pos,
-                        inp_dsv4->get_hca().state_write_idxs, il));
+                        inp_dsv4->get_hca().state_write_idxs_lid, il));
         }
     }
 

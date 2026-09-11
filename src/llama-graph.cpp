@@ -954,6 +954,7 @@ static void dsv4_set_comp_inputs(
     dsv4_set_i32(inp.state_snapshot_dst_idxs, plan.state_snapshot_dst_idxs);
     dsv4_set_i32(inp.state_read_idxs, plan.state_read_idxs);
     dsv4_set_i64(inp.state_write_idxs, plan.state_write_idxs);
+    dsv4_set_i64(inp.state_write_idxs_lid, plan.state_write_idxs_lid);
     dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
     dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
     if (inp.lid_mask != inp.kq_mask) {
@@ -1048,6 +1049,7 @@ static void dsv4_build_comp_inputs(
     inp.state_snapshot_dst_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_snapshot_dst_idxs.size(), std::string("dsv4_") + name + "_state_snapshot_dst_idxs");
     inp.state_read_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_read_idxs.size(), std::string("dsv4_") + name + "_state_read_idxs");
     inp.state_write_idxs = dsv4_build_input_1d(ctx, GGML_TYPE_I64, plan.state_write_idxs.size(), std::string("dsv4_") + name + "_state_write_idxs");
+    inp.state_write_idxs_lid = dsv4_build_input_1d(ctx, GGML_TYPE_I64, plan.state_write_idxs_lid.size(), std::string("dsv4_") + name + "_state_write_idxs_lid");
     inp.state_write_pos = dsv4_build_input_1d(ctx, GGML_TYPE_I32, plan.state_write_pos.size(), std::string("dsv4_") + name + "_state_write_pos");
 
     if (plan.n_kv > 0) {

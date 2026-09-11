@@ -150,6 +150,7 @@ public:
     // V4 pools overlapping groups (its compressor is twice as wide); V4.1 pools disjoint
     // ones, like the reference's unflatten(1, (-1, ratio))
     bool get_comp_overlap() const { return comp_overlap; }
+    uint32_t get_lid_ratio() const { return lid_ratio; }
 
     // Compressed token ids per (sequence, position), for the engram n-gram lookback. Empty when
     // the model has no engram. ENGRAM_NONE marks a position that was never written.
@@ -157,6 +158,8 @@ public:
     static constexpr int32_t ENGRAM_DEAD = -1;
 
     bool engram_enabled() const { return !engram_hist.empty(); }
+    void engram_hist_copy(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
+    void engram_hist_clear(llama_seq_id seq_id, llama_pos p0);
     void engram_set(llama_seq_id seq_id, llama_pos pos, int32_t cid);
     int32_t engram_get(llama_seq_id seq_id, llama_pos pos) const;
     llama_kv_cache      * get_lid() const;
@@ -182,6 +185,9 @@ private:
     const uint32_t csa_ratio;
     const uint32_t hca_ratio;
     const bool     comp_overlap;
+    // the index cache holds one key per compressed position, so it is sized by the finest
+    // ratio any source compresses at. Everything that counts its rows needs this, not csa_ratio.
+    const uint32_t lid_ratio;
 
     std::vector<uint32_t> rs_idx;
 
@@ -330,6 +336,9 @@ public:
         // Final compressed-cache row ids written by state-backed commits.
         // A non-boundary CSA/LID decode step can target a masked scratch row.
         std::vector<int64_t> state_write_idxs;
+        // the same rows, addressed with the index cache's own per-stream stride: it is sized
+        // by the finest ratio and the compressor cache by its own, so the offsets differ
+        std::vector<int64_t> state_write_idxs_lid;
 
         // RoPE positions for state-backed commits.
         std::vector<int32_t> state_write_pos;
