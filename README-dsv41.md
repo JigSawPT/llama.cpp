@@ -46,7 +46,7 @@ Linux builds are untested on this branch; the streaming code has POSIX paths (`p
 ## Run
 
 The target GGUF is 502 GB, of which 189 GiB are the two engram tables. They are never loaded:
-the loader maps them and the host reads 56 rows per token. Everything else that does not fit in
+the loader maps them and the host reads 48 rows per token. Everything else that does not fit in
 the VRAM cache streams from disk through the host tier. Put the file on an NVMe.
 
 ```
