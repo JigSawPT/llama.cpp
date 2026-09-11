@@ -1058,7 +1058,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     // only an index source owns an indexer; the layers after it reuse what it picked
     ggml_tensor * top_k = nullptr;
     if (topk_carry == nullptr || hparams.dsv4_is_index_source[il]) {
-        top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, inp_csa.kq_mask,
+        // the indexer wants the mask typed for itself; the attention keeps inp_csa.kq_mask
+        top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, inp_csa.lid_mask,
                 inp_csa.cand_pin, cand_carry, il);
         if (topk_carry) {
             *topk_carry = top_k;

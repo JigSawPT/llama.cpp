@@ -186,6 +186,28 @@ class DeepseekV41Model(DeepseekV4Model):
         logger.info("engram: hash tables written, compressed vocab %d, primes sum matches both tables",
                     n_compressed)
 
+        self._write_engram_rows()
+
+    def _write_engram_rows(self) -> None:
+        """The two lookup tables, byte for byte.
+
+        They cannot go through prepare_tensors: nothing there would stop quantize() from
+        turning the fp8 bytes into floats, which both doubles the size and destroys the
+        contents -- and the loader only checks shapes, never types, so it would load quietly
+        and produce garbage. add_tensor with an int8 view maps to I8, one byte per element,
+        which is exactly what the C++ side reads."""
+        for bid in self._engram_layer_ids:
+            for sufixo, chave in (("weight", gguf.MODEL_TENSOR.ENGRAM_EMBED),
+                                  ("scale",  gguf.MODEL_TENSOR.ENGRAM_EMBED_SCALE)):
+                origem = f"layers.{bid}.engram.embed.{sufixo}"
+                mm = self._engram_memmap(origem)
+                if mm is None:
+                    raise ValueError(f"{origem}: sem memmap, e esta tabela nao pode ser materializada")
+                out = self._format_dsv4_tensor_name(chave, int(bid), ".weight")
+                self.gguf_writer.add_tensor(out, mm.view(np.int8))
+                logger.info("engram_embd_raw %s -> %s: %.1f GiB as I8, byte for byte",
+                            origem, out, mm.nbytes/2**30)
+
     def generate_extra_tensors(self):
         if self.convert_engram and not getattr(self, "_engram_tables_done", False):
             self._engram_tables_done = True
@@ -202,6 +224,10 @@ class DeepseekV41Model(DeepseekV4Model):
         if name.endswith("ffn.gate.bias_vl"):
             return None
         if ".engram." in name and not cls.convert_engram:
+            return None
+        # the two lookup tables are written directly in generate_extra_tensors; letting them
+        # into the tensor loop would upcast them to float32 before modify_tensors even runs
+        if cls._ENGRAM_RAW in name:
             return None
         return super().filter_tensors(item)
 

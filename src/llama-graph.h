@@ -575,6 +575,11 @@ public:
 
         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
 
+        // the same mask, typed for the lightning indexer instead of for attention: the fused
+        // op asserts F16 and the unfused path adds it to an F32 score. Aliases kq_mask when
+        // the two types already agree.
+        ggml_tensor * lid_mask   = nullptr;
+
         // V4.1 first-level indexer: +inf on the block holding each query's newest compressed
         // position, 0 elsewhere. Null when the model has no block selection, or when every
         // block fits in the top-k and the selection is provably the identity.

@@ -956,6 +956,9 @@ static void dsv4_set_comp_inputs(
     dsv4_set_i64(inp.state_write_idxs, plan.state_write_idxs);
     dsv4_set_i32(inp.state_write_pos, plan.state_write_pos);
     dsv4_set_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
+    if (inp.lid_mask != inp.kq_mask) {
+        dsv4_set_kq_mask(inp.lid_mask, plan, n_tokens, n_stream);
+    }
 
     if (debug || dsv4_compress_debug()) {
         LLAMA_LOG_INFO("%s: %s n_tokens=%u, n_stream=%d, state_persist_dst=%s, state_write_pos=%s\n",
@@ -1004,6 +1007,9 @@ static bool dsv4_can_reuse_comp_input(
     res &= dsv4_can_reuse_tensor_1d(inp.state_write_idxs, plan.state_write_idxs.size());
     res &= dsv4_can_reuse_tensor_1d(inp.state_write_pos, plan.state_write_pos.size());
     res &= dsv4_can_reuse_kq_mask(inp.kq_mask, plan, n_tokens, n_stream);
+    if (inp.lid_mask != inp.kq_mask) {
+        res &= dsv4_can_reuse_kq_mask(inp.lid_mask, plan, n_tokens, n_stream);
+    }
 
     return res;
 }
@@ -1053,6 +1059,17 @@ static void dsv4_build_comp_inputs(
         inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
         ggml_set_input(inp.kq_mask);
         ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+
+        // the indexer scores against this group's positions but needs the fused_lid type,
+        // not the attention one. Same tensor when they agree, which is the common case.
+        const ggml_type lid_type = cparams.fused_lid ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        if (lid_type == inp.kq_mask->type) {
+            inp.lid_mask = inp.kq_mask;
+        } else {
+            inp.lid_mask = ggml_new_tensor_4d(ctx, lid_type, plan.n_kv, n_tokens/n_stream, 1, n_stream);
+            ggml_set_input(inp.lid_mask);
+            ggml_set_name(inp.lid_mask, (std::string("dsv4_") + name + "_lid_mask").c_str());
+        }
 
         // the block pin is only built when the selection can bite: with every block inside the
         // top-k the mask it produces is the identity (bench/dsv41/prova_blocos_candidatos.py)

@@ -1337,7 +1337,11 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 }
 
 void llama_kv_cache_dsv4::engram_set(llama_seq_id seq_id, llama_pos pos, int32_t cid) {
-    if (engram_hist.empty() || pos < 0 || (uint32_t) pos >= engram_hist_size) {
+    // seq_id has to be checked like every sibling here does: engram_hist holds n_seq_max
+    // rows, but with a unified cache the batch validator admits any seq_id below
+    // LLAMA_MAX_SEQ, and an unchecked one writes past the end of the vector
+    if (engram_hist.empty() || seq_id < 0 || (uint32_t) seq_id >= n_seq_max ||
+            pos < 0 || (uint32_t) pos >= engram_hist_size) {
         return;
     }
 
@@ -1345,7 +1349,8 @@ void llama_kv_cache_dsv4::engram_set(llama_seq_id seq_id, llama_pos pos, int32_t
 }
 
 int32_t llama_kv_cache_dsv4::engram_get(llama_seq_id seq_id, llama_pos pos) const {
-    if (engram_hist.empty() || pos < 0 || (uint32_t) pos >= engram_hist_size) {
+    if (engram_hist.empty() || seq_id < 0 || (uint32_t) seq_id >= n_seq_max ||
+            pos < 0 || (uint32_t) pos >= engram_hist_size) {
         return ENGRAM_NONE;
     }
 
