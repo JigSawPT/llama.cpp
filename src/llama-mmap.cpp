@@ -1205,3 +1205,42 @@ const bool llama_mlock::SUPPORTED = false;
 size_t llama_path_max() {
     return PATH_MAX;
 }
+
+// Best effort, and deliberately silent on failure: this only ever makes reads faster, so a
+// system that cannot do it must not be told about it once per token.
+void llama_prefetch_ranges(void * const * addrs, const size_t * sizes, size_t n) {
+    if (n == 0) {
+        return;
+    }
+#ifdef _WIN32
+#if _WIN32_WINNT >= 0x602
+    static BOOL (WINAPI *pPrefetchVirtualMemory)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG) = nullptr;
+    static bool procurado = false;
+    if (!procurado) {
+        procurado = true;
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *)
+                GetProcAddress(hKernel32, "PrefetchVirtualMemory");
+        }
+    }
+    if (pPrefetchVirtualMemory == nullptr) {
+        return;
+    }
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges(n);
+    for (size_t i = 0; i < n; i++) {
+        ranges[i].VirtualAddress = addrs[i];
+        ranges[i].NumberOfBytes  = (SIZE_T) sizes[i];
+    }
+    pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) n, ranges.data(), 0);
+#else
+    GGML_UNUSED(addrs); GGML_UNUSED(sizes);
+#endif
+#elif defined(_POSIX_MAPPED_FILES)
+    for (size_t i = 0; i < n; i++) {
+        posix_madvise(addrs[i], sizes[i], POSIX_MADV_WILLNEED);
+    }
+#else
+    GGML_UNUSED(addrs); GGML_UNUSED(sizes);
+#endif
+}

@@ -1,5 +1,9 @@
 #include "llama-graph.h"
 
+#include "llama-mmap.h"
+
+#include <cinttypes>
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-engram.h"
@@ -154,8 +158,21 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     }
 
     std::vector<int32_t> hist(t.max_ngram);
-    std::vector<int64_t> rows(t.n_hash_cols);
     std::vector<float>   buf(row*n_tokens);
+    // every row this layer will read, hashed before anything is read
+    std::vector<int64_t> todas((size_t) n_tokens * t.n_hash_cols);
+    std::vector<void *>  enderecos;
+    std::vector<size_t>  tamanhos;
+    enderecos.reserve(todas.size()*2);
+    tamanhos .reserve(todas.size()*2);
+
+    // H4. These rows are random reads over a 189 GiB mapping, issued one at a time on the
+    // thread the graph is waiting on. The addresses come from the token ids alone, so nothing
+    // about them has to wait for anything -- which is the whole reason this is worth timing.
+    static int64_t t_engram_us  = 0;
+    static int64_t n_engram_row = 0;
+    static int64_t n_engram_set = 0;
+    const int64_t t0_engram = ggml_time_us();
 
     for (uint32_t e = 0; e < t.n_layer; ++e) {
         const auto & layer = model.layers[hparams.engram_layer_ids[e]];
@@ -165,6 +182,10 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         const uint8_t * w  = (const uint8_t *) layer.engram_embd->data;
         const uint8_t * sc = (const uint8_t *) layer.engram_embd_scale->data;
 
+        // H4. Two passes on purpose. The first only hashes -- it touches no table memory, so it
+        // cannot fault -- and by the end of it every address this layer will read is known.
+        // The second reads. Between them, the OS is handed the whole list at once, so the
+        // faults go out together instead of one per row on the thread the graph waits on.
         for (uint32_t i = 0; i < n_tokens; ++i) {
             const llama_seq_id s = ubatch->seq_id[i][0];
             const llama_pos    p = ubatch->pos[i];
@@ -179,17 +200,40 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
                 hist[g] = blocked ? t.pad_id : cid;
             }
 
-            llama_engram_hash_row(t, e, hist.data(), rows.data());
+            llama_engram_hash_row(t, e, hist.data(), todas.data() + (size_t) i*t.n_hash_cols);
+        }
 
+        enderecos.clear();
+        tamanhos.clear();
+        for (size_t k = 0; k < todas.size(); ++k) {
+            enderecos.push_back((void *) (w  + (size_t) todas[k]*t.head_dim));
+            tamanhos .push_back(t.head_dim);
+            enderecos.push_back((void *) (sc + (size_t) todas[k]*(t.head_dim/32)));
+            tamanhos .push_back(t.head_dim/32);
+        }
+        llama_prefetch_ranges(enderecos.data(), tamanhos.data(), enderecos.size());
+
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const int64_t * r = todas.data() + (size_t) i*t.n_hash_cols;
             float * dst = buf.data() + (size_t) i*row;
             for (uint32_t c = 0; c < t.n_hash_cols; ++c) {
-                llama_engram_dequant_row(w  + (size_t) rows[c]*t.head_dim,
-                                         sc + (size_t) rows[c]*(t.head_dim/32),
+                llama_engram_dequant_row(w  + (size_t) r[c]*t.head_dim,
+                                         sc + (size_t) r[c]*(t.head_dim/32),
                                          t.head_dim, dst + (size_t) c*t.head_dim);
             }
         }
 
         ggml_backend_tensor_set(kv[e], buf.data(), 0, row*n_tokens*sizeof(float));
+    }
+
+    t_engram_us  += ggml_time_us() - t0_engram;
+    n_engram_row += (int64_t) t.n_layer * n_tokens * t.n_hash_cols;
+    n_engram_set++;
+    if ((n_engram_set % 64) == 0) {
+        LLAMA_LOG_DEBUG("engram: %" PRId64 " us over %" PRId64 " set_input calls, %" PRId64 " rows "
+                "(%.3f ms per call, %.1f us per row)\n",
+                t_engram_us, n_engram_set, n_engram_row,
+                t_engram_us/1000.0/n_engram_set, (double) t_engram_us/n_engram_row);
     }
 }
 

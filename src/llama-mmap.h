@@ -99,3 +99,8 @@ private:
 };
 
 size_t llama_path_max();
+
+// Ask the OS to fault in several ranges at once. The caller knows every address before it
+// needs any of them, so the alternative is one fault at a time on the thread that is waited
+// on. Best effort by definition: a failure just means the reads happen the slow way.
+void llama_prefetch_ranges(void * const * addrs, const size_t * sizes, size_t n);
