@@ -859,8 +859,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
     plan.state_snapshot_src_idxs.resize(n_snapshot);
     plan.state_snapshot_dst_idxs.resize(n_snapshot);
     plan.state_read_idxs .resize((overlap ? 2u : 1u)*ratio*n_blocks);
-    plan.state_write_idxs_lid.resize(plan.state_write_idxs.size());
     plan.state_write_idxs.resize(n_blocks);
+    // the parallel vector has to be sized after the one it mirrors, not before: taken in the
+    // other order it copies a zero and the graph gets an empty index tensor
+    plan.state_write_idxs_lid.resize(n_blocks);
     plan.state_write_pos .resize(n_blocks);
 
     return plan;
