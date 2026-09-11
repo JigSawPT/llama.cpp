@@ -395,8 +395,32 @@ class GGUFWriter:
             self.tensors[-1][name].tensor = tensor
             return
 
-        tensor.tofile(self.temp_file)
+        GGUFWriter._write_in_chunks(self.temp_file, tensor)
         self.write_padding(self.temp_file, tensor.nbytes)
+
+    # 512 MiB: abaixo disto o caminho e o de sempre e nada muda
+    _CHUNK_THRESHOLD = 512 * 1024 * 1024
+
+    @staticmethod
+    def _write_in_chunks(fp: IO[bytes], tensor: np.ndarray) -> None:
+        """Write a tensor without materializing it.
+
+        ndarray.tofile() needs a real file; given a wrapper it falls back to tobytes(), which
+        builds a full copy in memory. For a 91 GiB memmap that is exactly what the memmap was
+        there to avoid, and it shows up as process commit climbing by the size of the tensor.
+        """
+        if tensor.nbytes <= GGUFWriter._CHUNK_THRESHOLD or tensor.ndim == 0:
+            tensor.tofile(fp)
+            return
+
+        rows = tensor.shape[0]
+        if rows == 0:
+            return
+        row_bytes = max(1, tensor.nbytes // rows)
+        step = max(1, GGUFWriter._CHUNK_THRESHOLD // row_bytes)
+
+        for i in range(0, rows, step):
+            fp.write(tensor[i:i + step].tobytes())
 
     def write_padding(self, fp: IO[bytes], n: int, align: int | None = None) -> None:
         pad = GGUFWriter.ggml_pad(n, align if align is not None else self.data_alignment) - n
